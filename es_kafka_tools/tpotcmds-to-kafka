@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+#
+# tpotcmds-to-kafka	This script summarizes Cowrie command input collected
+#			from a set of tpot honeypot hosts.  The summarized 
+#			Cowrie data are sent to a Kafka server.
+#			This script gets data from the unified tpot data stored
+#			on one Elastic engine.
+#
+#	usage:
+#		tpotcmds-to-kafka [-... | -help | -Version] <tpot1> ... <tpotN>
+#
+# Revision History
+#	1.0	Initial revision.				210414
+#
+#	Written by Wayne Morrison, 210414.
+#
+
+import os
+import sys
+import time
+
+import argparse
+import subprocess
+import re
+
+from elasticsearch import Elasticsearch
+from elasticsearch import helpers
+from elasticsearch.helpers import scan
+
+import json
+
+from kafka import KafkaProducer
+
+#
+# Version information.
+#
+NAME = "tpotcmds-to-kafka"
+VERS = NAME + " version: 1.0"
+
+#------------------------------------------------------------------------
+
+man = '''
+
+NAME
+
+tpotcmds-to-kafka - summarizes Cowrie command input from tpot hosts
+
+SYNOPSIS
+
+  tpotcmds-to-kafka [options] <tpot1> ... <tpotN>
+
+DESCRIPTION
+
+tpotcmds-to-kafka summarizes Cowrie command input collected from a set of
+Tpot honeypot hosts and sends the summary to a Kafka server.  The Cowrie
+data are stored on a unified Elasticsearch engine.
+
+Each entry in the Cowrie command data is a command line sent by a remote
+host.  The command lines vary widely in content and format, from a single
+command or a single command with options, up to very complex command
+pipelines and sequences.  The following are examples that were sent to
+one of our tpot hosts:
+
+	top
+
+	uname -m
+
+	lscpu | grep Model
+
+	cat /proc/cpuinfo | grep name | wc -l
+
+	echo "12345678\\nHuS88aemGaM1\\nHuS88aemGaM1\\n"|passwd
+
+	cd /dev/shm; cat .s || cp /bin/echo .s; /bin/busybox QVTTR
+
+The data stored from each Cowrie record are:
+
+	index name
+	time stamp
+	Tpot name
+	IP address of the incoming client
+	country code of the IP address
+	session identifier
+	command line
+
+USAGE
+
+tpotcmds-to-kafka is assumed to be run on a periodic basis, probably daily.
+With no options, all Cowrie commands from the Elastic server will be sent to
+the Kafka server.  Several options modify this behavior.
+
+The -config option specifies a configuration file.  This file records Tpot
+names and the last index sent to Kafka for each Tpot.  The config file will
+be updated to reflect the most recent index tpotcmds-to-kafka sent to Kafka.
+This is expected to be the standard way of using tpotcmds-to-kafka in a cron
+job.
+
+The first time tpotcmds-to-kafka is run, it should be given an empty config
+file.  As it runs, sending Tpot data to Kafka, the empty config file will be
+filled with relevant data showing progress.  From that point on, using that
+config file will keep submitted data up to date.
+
+The -before option specifies a date limit for indices.  Only indices with a
+date prior to the given date will be sent to Kafka.  The date format is
+YYYY.MM.DD.  So, January 9, 2021 will be given as 2021.01.09.
+
+The -after option specifies a date limit for indices.  Only indices with a
+date after the given date will be sent to Kafka.  The date format is
+YYYY.MM.DD.  So, January 9, 2021 will be given as 2021.01.09.
+
+The -config option may not be used with the -before or -after options.
+
+Either a list of Tpot hostnames or the -all option must be given.  Only
+recognized Tpots will be handled.
+
+
+It is extremely likely that the SSH parameters (e.g., hostnames and ports)
+will have to be modified to fit the environment of the user.
+
+OPTIONS
+
+tpotcmds-to-kafka takes the following options:
+
+	-after yyyy.mm.dd
+		Give entries after this date.
+		This date must be before the -before date, if that is given.
+
+	-before yyyy.mm.dd
+		Give entries before this date.
+		This date must be after the -after date, if that is given.
+
+	-config conffile
+		configuration file for tpotcmds-to-kafka
+		If the specified file does not exist, an empty file will be
+		created and processing for all Tpots will start from the
+		first index.
+
+	-list
+		Display the list of recognized tpots.
+
+	-tunnel
+		Set up an SSH tunnel for communications.
+
+	-Version
+		Display the version information for tpotcmds-to-kafka.
+
+	-help
+		Display a help message.
+
+	-man
+		Display the manual page.
+
+AUTHOR
+
+Wayne Morrison, tewok@tislabs.com
+
+'''
+
+#------------------------------------------------------------------------
+
+
+woof = 0					# Debugging location.
+
+#------------------------------------------------------------------------
+# Info about gateway and kafka hosts.
+#
+
+esengine = 'watermelon'				# tislabs' Elasticsearch engine.
+
+GWHOST = 'cerberus-old-gateway'			# Gateway host to tislabs.
+
+INDICESURL= 'localhost:64290/_cat/indices'	# URL for getting index list.
+
+
+#
+# Definitions for talking to Kafka.
+#
+KAFKA_HOST = 'pars-kafka.tislabs.com:9092'
+
+KAFKA_FEED = 'parsons_gawseed_tpots_commands'
+KAFKA_FEED = 'test'
+
+#------------------------------------------------------------------------
+# Option fields.
+#	options handled:
+#		-all		run for all defined tpots
+#		-after		entries after this date
+#		-before		entries before this date
+#		-config		configuration file for tpotcmds-to-kafka
+#		-list		list all defined tpots
+#		-man		give man page and exit
+#		-help		give usage message and exit
+#		-verbose	give verbose output
+#		-Version	give command version info and exit
+#
+
+after	 = ''			# All entries after this data.	(-after)
+before	 = ''			# All entries before this data.	(-before)
+compflag = 0			# All-entries flag.		(-complete)
+config	 = ''			# Configuration file.		(-config)
+tunnelflag = ''			# Use an ssh tunnel.		(-tunnel)
+verbose	 = 0			# Verbose flag.			(-verbose)
+
+tpotlist = []		# List of tpots whose Elastic indices will be searched.
+
+debug = 0			# Internal debugging flag.
+
+#------------------------------------------------------------------------
+# Globbies.
+#
+
+NAPTIME = 5			# Seconds to wait for tunnel initialization.
+
+idx2tpot = dict()		# Name of an index's tpot.
+
+FIRST	= '0000.00.00'		# Impossible timestamp of first post.
+LAST	= '9999.99.99'		# Impossible timestamp of last post.
+
+
+#
+# Tpots whose data we may retrieve.
+# These should be defined in the .ssh/config file.
+#
+known_tpots = [
+		'tpot',
+		'tpot2',
+		'tpot3',
+		'tpot4'
+	      ]
+
+#
+# Date of last entry we post for each tpot.
+#
+lastdates = dict()
+
+#
+# Kafka producer object.
+#
+kafprod = None
+
+
+#
+# Original stdout.
+#
+origout = None
+
+#------------------------------------------------------------------------
+# Routine:	main()
+#
+# Purpose:	Do shtuff.
+#
+def main():
+	global kafprod				# Kafka producer.
+	global origout				# Original stdout.
+
+	global woof				# Debugging location.
+	
+	#
+	# Parse our command line.
+	#
+	getopts()
+
+	if(config == ''):
+		print("\nno config file specified\n")
+	elif(config == None):
+		print("\nnone config file specified\n")
+	else:
+		print("\nwriting new config file:  %s\n" % config)
+		
+
+	origout = sys.stdout
+
+	#
+	# Set up a tunnel to the Elasticsearch engine.
+	#
+	digger(esengine)
+
+	#
+	# Get the indices to search.
+	#
+	indices = getindices()
+
+	#
+	# Initialize our connection to the Elasticsearch engine.
+	#
+	(es, qstr) = esinit()
+
+	#
+	# Initialize our connection to the Kafka engine.
+	#
+	kafprod = KafkaProducer(value_serializer=lambda v: json.dumps(v).encode('utf-8'), bootstrap_servers=KAFKA_HOST)
+
+	origout.write("sending to feed %s on %s\n" % (KAFKA_FEED, KAFKA_HOST))
+
+	origout.write("\n\nreading indices:\n")
+	for idxfile in indices:
+
+		curtpot = idx2tpot[idxfile]
+
+		origout.write("%08s\t%s\n" % (curtpot, idxfile))
+
+		#
+		# Open this index's output file.
+		#
+		outfn = "out.kafka.%s" % curtpot
+		sys.stdout = open(outfn, 'a')
+
+		#
+		# Run our query.
+		#
+		results = getesdata(es, qstr, curtpot, idxfile)
+
+		sys.stdout.close()
+
+
+	#
+	# Close the tpot tunnel we opened.
+	#
+	closetunnel()
+
+	#
+	# Once more, just to be sure.
+	#
+	newconfig()
+
+	sys.exit(0)
+
+
+#------------------------------------------------------------------------
+# Routine:	getopts()
+#
+# Purpose:	Parse the command line for options.
+#
+def getopts():
+	global tpotlist				# Name of tpot to contact.
+	global compflag				# -complete option given.
+	global after				# -after option.
+	global before				# -before option.
+	global config				# -config option.
+	global tunnelflag			# -tunnel option.
+	global verbose				# -verbose flag.
+
+	#
+	# Build our usage string.
+	#
+	usagestr = usage(0)
+
+	#
+	# Build the options parser.
+	#
+	ap = argparse.ArgumentParser(usage=usagestr, add_help=False)
+
+	#
+	# Add the recognized options.
+	#
+	ap.add_argument('-Version',  action='version', version=VERS)
+	ap.add_argument('-help',     action='store_true')
+	ap.add_argument('-verbose',  action='store_true')
+	ap.add_argument('-man',      action='store_true')
+
+
+	ap.add_argument('-all',	     action='store_true')
+	ap.add_argument('-complete', action='store_true')
+	ap.add_argument('-list',     action='store_true')
+	ap.add_argument('-tunnel',   action='store_true')
+
+	ap.add_argument('-after')
+	ap.add_argument('-before')
+	ap.add_argument('-config')
+
+	ap.add_argument('tpotlist',  nargs='*')
+
+	#
+	# Now parse the options.
+	#
+	args = ap.parse_args()
+
+	#
+	# Check for some immediate options.
+	#
+	if(args.help):		usage(1)
+	if(args.man):		manpage()
+	if(args.verbose):	verbose	   = 1
+	if(args.complete):	compflag   = 1
+	if(args.tunnel):	tunnelflag = 1
+
+	#
+	# -config is mutually exclusive from -before and -after.
+	#
+	if(args.config and (args.after or args.before)):
+		if(args.after and args.before):
+			print("-config may not be used with -before and -after")
+		elif(args.after):
+			print("-config may not be used with -after")
+		elif(args.before):
+			print("-config may not be used with -before")
+		exit(1)
+
+	#
+	# Check for the -config option and read it.
+	#
+	if(args.config):
+		config = args.config
+		if(verbose):
+			print("using configuration file %s" % config)
+
+		readconfig(config)
+
+	#
+	# Check for the -after option and validate its value.
+	#
+	if(args.after):
+		after = args.after
+
+		aftpat = r'^\d{4}\.\d{2}\.\d{2}$'
+
+		match = re.search(aftpat, after)
+		if(match == None):
+			print("invalid -after option, must be \"YYYY.MM.DD\"")
+			exit(3)
+
+		if(verbose):
+			print("looking for indices after %s" % after)
+
+	#
+	# Check for the -before option and validate its value.
+	#
+	if(args.before):
+		before = args.before
+
+		befpat = r'^\d{4}\.\d{2}\.\d{2}$'
+
+		match = re.search(befpat, before)
+		if(match == None):
+			print("invalid -before option, must be \"YYYY.MM.DD\"")
+			exit(3)
+
+		if(verbose):
+			print("looking for indices before %s" % before)
+
+	#
+	# Ensure that after date is before before date, if both were given.
+	#
+	if(before and after):
+		if(after >= before):
+			print("-after date (%s) must be before -before date (%s)" % (after, before))
+			exit(3)
+
+	#
+	# If -complete is given, then after and before dates are ignored.
+	#
+	if(compflag):
+		after = FIRST
+		before = LAST
+
+	#
+	# Set up the tpot list.
+	#
+	if(args.all):
+		tpotlist = known_tpots
+	else:
+		if(args.tpotlist):
+			tpotlist = args.tpotlist
+		else:
+			usage(1)
+
+	#
+	# Convert "tpot1" references to "tpot".
+	#
+	for ind in range(0, len(tpotlist)):
+		if(tpotlist[ind] == 'tpot1'):
+			tpotlist[ind] = 'tpot'
+
+	#
+	# If the list argument was given, list the known tpots and exit.
+	#
+	if(args.list):
+		for tpot in sorted(known_tpots):
+			print(tpot)
+		exit(0)
+
+	if(verbose):
+		print("tpotlist  - %s" % tpotlist)
+		print("")
+
+
+#----------------------------------------------------------------------
+# Routine:	esinit()
+#
+# Purpose:	Initialize some Elasticsearch fields.
+#
+def esinit():
+
+	#
+	# Set up a connection to Elastic.
+	#
+
+	urlpfxstr = "es"
+
+	try:
+#		es = Elasticsearch([{'host': 'localhost', 'port': 64297,
+#					'url_prefix': urlpfxstr}], timeout=30,
+#					use_ssl=True, verify_certs=False,
+#					max_retries=10, retry_on_timeout=True)
+
+#		esloc = [{'host': 'localhost', 'port': 64290, 'url_prefix': urlpfxstr}]
+		esloc = [{'host': 'localhost', 'port': 64290}]
+
+		timer = 30
+		usessl = False
+		vercerts = False
+		authvals=('username', 'password')
+		retrycnt = 10
+		retryflag = True
+
+		es = Elasticsearch(esloc,
+					timeout=timer,
+					use_ssl=usessl,
+					verify_certs=vercerts,
+					http_auth=authvals,
+					max_retries=retrycnt,
+					retry_on_timeout=retryflag)
+
+# curl -s -X GET localhost:64290/tpot-logstash-2020.08.23
+
+
+	except Exception as exc:
+		print("\nunable to connect to watermelon's Elasticsearch\n")
+		print(exc)
+		print("")
+		exit(9)
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Cowrie"}},{"match":{"eventid" : "cowrie.command.input"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "Cowrie"
+						}
+					},
+					{
+						"match":
+						{
+							"eventid" : "cowrie.command.input"
+						}
+					}
+				]
+			}
+		},
+
+		"_source":
+		[
+			"_index",
+			"@timestamp",
+			"timestamp",
+			"src_ip",
+			"geoip",
+			"ip_rep",
+			"input",
+			"session",
+			"t-pot_hostname",
+			"t-pot_ip_ext"
+		]
+	}
+
+	#
+	# Give the goods to our caller.
+	#
+	return(es, qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	getesdata()
+#
+# Purpose:	Get a command data from Elasticsearch for a particular tpot.
+#
+def getesdata(es, querystr, tpotname, idx):
+
+	global lastdates			# Last date posted for tpots.
+
+	entries = list()
+
+	try:
+		#
+		# Get the iterator for all the matching queries.
+		#
+		sciter = helpers.scan(es, index=idx, query=querystr)
+#		sciter = helpers.scan(es, index=idx, raise_on_error=False, query=querystr)
+
+		for doc in sciter:
+
+			#
+			# Skip empty documents.
+			#
+			if(doc == {}):
+				continue
+
+			#
+			# Ensure this doc has a _source field.
+			#
+			if('_source' not in doc):
+				print("\t\t---> _source not in doc!")
+				continue
+			src = doc['_source']
+
+			#
+			# Get shortcuts for the fields we've fetched.
+			#
+
+			chron = '(no timestamp)'
+			if('timestamp' in src):
+				chron = src['timestamp']
+
+			cmdline = '(no input)'
+			if('input' in src):
+				cmdline = src['input']
+
+			countrycode2 = '(no geoip.country_code2)'
+			if('geoip' in src):
+				geoip = src['geoip']
+
+				if('country_code2' in geoip):
+					countrycode2 = geoip['country_code2']
+
+			session = '(no session)'
+			if('session' in src):
+				session = src['session']
+
+			srcip = '(no src_ip)'
+			if('src_ip' in src):
+				srcip = src['src_ip']
+
+
+			if(len(cmdline) == 0):
+				cmdline = '(empty command line)'
+
+
+			#
+			# srcip - IP of client
+			#
+
+			fields = dict()
+
+			fields['index']   = idx
+			fields['time']	  = chron
+			fields['tpot']	  = tpotname
+			fields['ip']	  = srcip
+			fields['country_code2']	= countrycode2
+			fields['session'] = session
+			fields['commands'] = [ cmdline ]
+
+			entries.append(fields)
+
+			#
+			# Put this index as the tpot's new last date.
+			#
+			match = re.search(r'logstash-(.+)', idx)
+			if(match != None):
+				newlast = match.group(1)
+				if(tpotname not in lastdates):
+					lastdates[tpotname] = '0000.00.00'
+				if(newlast > lastdates[tpotname]):
+					lastdates[tpotname] = newlast
+
+	except Exception as exc:
+		print("\texception:  %s" % exc)
+		print("\nhandling index %s\n" % idx)
+		print("")
+
+		closetunnel()
+		exit(20)
+
+	#
+	# Send this index' data to Kafka.
+	try:
+		foo = kafprod.send(KAFKA_FEED, entries)
+
+	except Exception as exc:
+		print("\nunable to send index %s to kafka\n" % idx)
+		print("\texception:  %s" % exc)
+		print("")
+
+		closetunnel()
+		exit(21)
+
+	#
+	# Save the new date to the configuration file.
+	#
+	newconfig()
+
+	print("index written:  %s" % idx)
+
+
+#------------------------------------------------------------------------
+# Routine:	readconfig()
+#
+# Purpose:	Read and handle a configuration file.
+#
+def readconfig(conffile):
+
+	#
+	# Start all tpots with the last dates at The Depths Of Time.
+	#
+	for tp in known_tpots:
+		lastdates[tp] = '0000.00.00'
+
+	#
+	# Ensure the config file exists.
+	#
+	try:
+		os.stat(conffile)
+	except Exception as exc:
+		fn = open(conffile, 'w')
+		fn.close()
+
+
+	#
+	# Read config data.
+	#
+	try:
+		fn = open(conffile, 'rU')
+		conflines = fn.readlines()
+		fn.close()
+
+		#
+		# Handle each line, adding it to the lastdates dict.
+		#
+		for ln in conflines:
+			#
+			# Skip blank lines and comments.
+			#
+			if(re.search(r'^\s*#', ln) == True):
+				continue
+
+			match = re.search(r'^(\S+)\s+(\S+)\s+(.*)', ln)
+			if(match == None):
+				print("unrecognized configuration line:  \"%s\"" % ln)
+				continue
+
+			#
+			# Get the pieces of the config line.
+			#
+			key  = match.group(1)
+			tpot = match.group(2)
+			kron = match.group(3)
+			print("---> <%s>\t<%s>\t<%s>" % (key, tpot, kron))
+
+			#
+			# If this is the date of the last Kafka post,
+			# save the date in the lastdates dict.
+			#
+			if(key == 'lastpost'):
+				lastdates[tpot] = kron
+				key = ''
+
+		print("last dates:")
+		for tp in sorted(lastdates):
+			print("\t%-30s%s" % (tp, lastdates[tp]))
+		print("\n")
+
+	except Exception as exc:
+		print("unable to read config file \"%s\"" % conffile)
+		print(exc)
+		exit(4)
+
+
+#------------------------------------------------------------------------
+# Routine:	digger()
+#
+# Purpose:	Open a tunnel to the Elasticsearch engine.  If there's
+#		already a tunnel open, we'll close it.  After creating
+#		the new tunnel, we'll wait a few seconds to ensure the
+#		tunnel has completed set-up.
+#
+#		For coarse values of "ensure".
+#
+def digger(esengine):
+
+	if(tunnelflag == 0):
+		return
+
+	closetunnel()
+
+	opentunnel(esengine)
+
+	time.sleep(NAPTIME)
+
+
+#------------------------------------------------------------------------
+# Routine:	closetunnel()
+#
+# Purpose:	Ensures the ssh tunnel is closed.
+#
+def closetunnel():
+
+	if(tunnelflag == 0):
+		return
+
+	#
+	# The command string we'll look for in processes.
+	#
+	sshcmd = 'ssh -fN'
+
+	#
+	# Get a list of running commands.
+	#
+	out = psout(["wax"])
+
+	#
+	# Find and kill the gateway process.
+	#
+	# We'll assume there's only one gateway process running.
+	#
+	for proc in out:
+
+		if(sshcmd in proc):
+
+			atoms = proc.split()
+
+			cpid = int(atoms[0])
+
+			os.kill(cpid, 1)
+
+			return
+
+
+#------------------------------------------------------------------------
+# Routine:	opentunnel()
+#
+# Purpose:	Opens a new ssh tunnel.
+#
+def opentunnel(rmthost):
+
+	if(tunnelflag == 0):
+		return
+
+	rmthost = GWHOST
+
+	print("\nconnecting to tunnel host \"%s\"\n" % rmthost)
+
+	sshargv = ["ssh", "-fN", rmthost]
+
+	#
+	# The run the ssh tunnel command in a subprocess.
+	#
+
+	cpid = os.spawnv(os.P_NOWAIT, "/usr/bin/ssh", sshargv)
+
+	return(cpid)
+
+
+#------------------------------------------------------------------------
+# Routine:	getindices()
+#
+# Purpose:	Gets a list of tpot indices from Elastic.
+#
+def getindices():
+
+	global idx2tpot				# Name of an index' tpot.
+	global after				# -after date.
+	global before				# -before date.
+	global woof				# Debugging field.
+
+	lines = []
+	ln = list()
+
+	woof = 21
+	print("\n\ngetting tpot indices from Elastic on watermelon\n")
+
+	#
+	# Default to looking at the whole range of time.
+	#
+	if(after == ''):
+		after = FIRST
+	if(before == ''):
+		before = LAST
+
+	print("after  - %s" % after)
+	print("before - %s" % before)
+	print("\n")
+
+	#
+	# Run the caller's command.
+	#
+	try:
+
+		woof = 22
+		cmdline = ['curl', '-s', '-X', 'GET', INDICESURL]
+
+		bout = subprocess.check_output(cmdline)
+
+	#
+	# Handle OSErrors -- most likely an unrecognized command.
+	#
+	except OSError as exc:
+		print("unable to get list of indices; is gateway enabled?\n")
+		print(exc.strerror)
+		exit(1);
+
+	#
+	# Handle CalledProcessErrors -- errors with the program we just ran.
+	#
+	except subprocess.CalledProcessError as exc:
+		print("unable to get list of indices; is gateway enabled?\n")
+		retcode = exc.returncode;
+		exit(retcode);
+
+	woof = 23
+	#
+	# Convert the command output into a string, and then split the lines.
+	#
+	out = bout.decode("utf-8")
+	for ln in sorted(out.splitlines()):
+
+		#
+		# Set up the pattern to find the index names.
+		#
+		fnpat = r'^\S+\s+\S+\s+(\S+)\s+'
+
+		#
+		# Skip any lines that don't fit this naming pattern.
+		#
+		match = re.search(fnpat, ln)
+		if(match == None):
+			continue
+
+		#
+		# Skip any indices whose names don't start with "tpot".
+		#
+		indfn = match.group(1)
+		if(indfn[0:4] != 'tpot'):
+			continue
+
+		#
+		# Skip any indices whose names don't start with "tpot"
+		# one of the desired tpot names.
+		#
+		fnpat = r'^(tpot\w*)\-.*\-(\d{4}\.\d{2}\.\d{2})'
+		match = re.search(fnpat, indfn)
+		if(match == None):
+			print("\tno tpot match in <%s>" % indfn)
+			continue
+
+		#
+		# Skip this index if it isn't a tpot index.
+		#
+		tpfx  = match.group(1)
+		if(tpfx not in tpotlist):
+			continue
+
+		#
+		# Get the date from the index name.
+		#
+		tstmp = match.group(2)
+
+		#
+		# Use the after-date from the config file, if there is one.
+		#
+		tpotafter = after
+		if(tpfx not in lastdates):
+			print("setting lastdates[%s] - <%s>" % (tpfx, after))
+			lastdates[tpfx] = after
+
+		tpotafter = lastdates[tpfx]
+
+		#
+		# Skip this index if it's after the -before date.
+		#
+		if(tstmp >= before):
+			continue
+
+		#
+		# Skip this index if it's before the after date.
+		#
+		if(tstmp <= tpotafter):
+			continue
+
+		#
+		# Skip this index if it's before the tpot's lastpost date.
+		#
+		if(tstmp < lastdates[tpfx]):
+			continue
+
+#		print("idx - \t<%s>" % indfn)
+
+		#
+		# Save the name of the tpot this is for.
+		# This is just an optimization so we don't have to dig
+		# out the tpot names later.
+		#
+		idx2tpot[indfn] = tpfx
+
+		#
+		# Add this index to our list of indices.
+		#
+		lines.append(indfn)
+
+	#
+	# Return the sorted converted output to our caller.
+	#
+	lines.sort()
+
+
+	return(lines)
+
+
+#------------------------------------------------------------------------
+# Routine:	psout()
+#
+# Purpose:	Runs a ps command with a given set of arguments.  The
+#		command is run in a subprocess The output the command
+#		writes to stdout is returned in a list.
+#
+def psout(cmdline):
+
+	cmdline.insert(0, '/bin/ps')
+
+	#
+	# Run the caller's command.
+	#
+	try:
+		bout = subprocess.check_output(cmdline)
+
+	#
+	# Handle OSErrors -- most likely an unrecognized command.
+	#
+	except OSError as exc:
+		print(exc.strerror)
+		exit(1);
+
+	#
+	# Handle CalledProcessErrors -- errors with the program we just ran.
+	#
+	except subprocess.CalledProcessError as exc:
+		retcode = exc.returncode;
+		print(exc.strerror)
+		exit(retcode);
+
+	#
+	# Convert the bytearray into a string, and then split the lines.
+	#
+	out = bout.decode("utf-8")
+	lines = out.splitlines()
+
+	#
+	# Return the converted output to our caller.
+	#
+	return(lines)
+
+
+#------------------------------------------------------------------------
+# Routine:	newconfig()
+#
+# Purpose:	Write a new configuration file.
+#		The data in the lastdates dict are written to the file.
+#
+def newconfig():
+
+	try:
+		if(config == ''):
+			if(verbose):
+				origout.write("\n\no config file specified\n\n")
+			return
+			
+		if(verbose):
+			origout.write("\nwriting new config file:  %s\n" % config)
+		ldout = open(config, 'w')
+		for tp in lastdates:
+			ldout.write("lastpost\t%s\t%s\n" % (tp, lastdates[tp]))
+		ldout.close()
+
+	except Exception as exc:
+		origout.write("error writing new config file:  %s" % config)
+		origout.write(exc.strerror)
+		exit(1);
+
+
+#----------------------------------------------------------------------
+# Routine:	usage()
+#
+# Purpose:	Do something with the usage message.
+#
+#		If the prtflag parameter is non-zero, we'll print and exit.
+#		If it is zero, we'll just return the string.
+#
+def usage(prtflag):
+
+	#
+	# Set up our usage string.
+	#
+	outstr = """usage:  tpotcmds-to-kafka [options] <tpot-name>
+
+        where [options] are:
+
+                -all            	get command data from all defined tpots
+                -after yyyy.mm.dd	give entries after this date
+                -before yyyy.mm.dd	give ntries before this date
+                -config conffile	configuration file for posting dates
+                -tunnel			set up an SSH tunnel for comms
+
+                -verbose		give verbose output
+                -Version		give version and exit
+                -help			show usage message
+                -man			give man page and exit
+ """
+
+	#
+	# Just return the output if we aren't to print the usage string.
+	#
+	if(prtflag == 0):
+		return(outstr)
+
+	#
+	# Print the usage string and exit.
+	#
+	print(outstr.rstrip())
+	exit(0)
+
+
+#----------------------------------------------------------------------
+# Routine:      manpage()
+#
+# Purpose:	Print the manpage and exit.
+#
+def manpage():
+
+	global man
+
+	print(man)
+	sys.exit(0)
+
+
+###############################################################################
+
+#------------------------------------------------------------------------
+#
+# Do everything.
+#
+
+if __name__ == '__main__':
+
+	try:
+		sys.exit(main())
+
+	except Exception as exc:
+		print("\nexception of some sort\n")
+		print(exc)
+#		print("\n\nwoof - %d\n\n" % woof)
+		print("")
+
+		#
+		# Close the tpot tunnel we opened.
+		#
+		closetunnel()
+
+		exit(31)
+

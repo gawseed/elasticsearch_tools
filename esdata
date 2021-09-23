@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+#
+# esdata	This script retrieves data from ElasticSearch.
+#
+#	usage:
+#		esdata [-cowrie | -fatt | -p0f | -suricata | -type <usertype> ]
+#
+# Revision History
+#	1.0	Initial revision.				210524
+#
+#	Written by Wayne Morrison, 210524.
+#
+
+import os
+import sys
+import time
+
+import argparse
+import subprocess
+
+from elasticsearch import Elasticsearch
+from elasticsearch import helpers
+from elasticsearch.helpers import scan
+
+# import json
+# import re
+
+
+#
+# Version information.
+#
+NAME = "esdata"
+VERS = NAME + " version: 1.0"
+
+#------------------------------------------------------------------------
+#
+# Fields for connecting to the ElasticSearch engine.
+# These are site-specific and must be initialize for each installation.
+#
+
+ESENGINE	= 'watermelon'			# tislabs' ElasticSearch engine.
+
+ESHOST		= 'cerberus'			# Gateway host to tislabs.
+
+LOCALPORT	= 64290				# Local gateway port.
+
+ESUSER		= 'usernamed'			# ElasticSearch user name.
+
+ESPASS		= 'password'			# ElasticSearch user password.
+
+#------------------------------------------------------------------------
+
+
+man = '''
+
+NAME
+
+esdata - esdata displays documents taken from an ElasticSearch engine
+
+SYNOPSIS
+
+  esdata [-cowrie | -fatt | -p0f | -suricata | -type <usertype> ]
+
+DESCRIPTION
+
+esdata displays documents taken from an ElasticSearch engine.
+The documents are displayed in single-line, JSON format, without
+any pretty-printing involved.  The documents are displayed in the
+order they are provided by ElasticSearch.
+
+Shorthand options are provided for displaying Cowrie, Fatt, P0f, and
+Suricata data.  A specific document type may be specified with the
+-type option.  A list of local document types as at the end of this
+man page.
+
+If no type-selectors are given, then all documents will be displayed.
+
+INITIAL SETUP
+
+Some connection-related fields must be initialized for a local installation
+of esdata.  It is set up to use an ssh tunnel to get to the ElasticSearch
+engine.  The fields for that and for connecting to the engine are given
+in variables towards the top of the esdata script.  These fields are:
+
+		ESENGINE	ElasticSearch engine's hostname
+
+		ESHOST		Gateway host to tislabs.
+
+		LOCALPORT	64290
+
+		ESUSER		User name for ElasticSearch access.
+
+		ESUSER		User password for ElasticSearch access.
+
+These must be set prior to using esdata.
+
+OPTIONS
+
+esdata takes the following options:
+
+	-cowrie			Display Cowrie data.
+
+	-fatt			Display Fatt data.
+
+	-p0f			Display P0f data.
+
+	-suricata		Display Suricata data.
+
+	-type <usertype>	Display a user-specified type of data.
+
+	-verbose		Display verbose information.
+
+	-Version		Display the version information for esdata.
+
+	-help			Display a help message.
+
+	-man			Display a manual page.
+
+LOCAL DOCUMENT TYPES
+
+esdata was written for the NSRG environment (at Parsons, Inc.) for the
+Gawseed project.  The ElasticSearch used by NSRG has been used for a
+number of other projects, and some of the indices remain on the engine.
+The following list is local to NSRG only; see the end of the getesdata()
+routine to find how to generate your own rudimentary list of document
+types.
+
+The following document types are from the first million documents
+returned by ElasticSearch.  The numbers for each type are the number
+of documents of that particular type in that first million.
+
+	Document Type				Count of Instances
+	-------------				------------------
+	P0f					586873
+	Suricata				232696
+	Fatt					58452
+	Cowrie					52101
+	Heralding				15014
+	Honeytrap				14071
+	Rdpy					12001
+	index_stats				7161
+	Dionaea					3759
+	kibana_stats				3633
+	kibana_settings				3626
+	D					3103
+	NGINX					2403
+	I					2078
+	asn					1037
+	Mailoney				1028
+	Adbhoney				283
+	application_usage_daily			129
+	Ciscoasa				108
+	Tanner					104
+	ui-metric				96
+	enrich_coordinator_stats		36
+	node_stats				34
+	CitrixHoneypot				26
+	ElasticPot				21
+	ConPot					20
+	canvas-workpad-template			10
+	cluster_stats				10
+	index-pattern				10
+	index_recovery				9
+	indices_stats				9
+	task					9
+	ui-counter				8
+	route					6
+	Honeysap				3
+	config					3
+	natural					3
+	apm-telemetry				2
+	application_usage_transactional		2
+	core-usage-stats			2
+	dummy-type				2
+	enterprise_search_telemetry		2
+	search-telemetry			2
+	space					2
+	spaces-usage-stats			2
+	ssh-rsa					2
+	telemetry				2
+	volcano					2
+	workplace_search_telemetry		2
+	earthquake				1
+	hijack					1
+	type-dummy				1
+
+AUTHOR
+
+Wayne Morrison, tewok@tislabs.com
+
+'''
+
+#------------------------------------------------------------------------
+# Option fields.
+#	options handled:
+#		-cowrie			get Cowrie data
+#		-fatt			get Fatt data
+#		-p0f			get P0f data
+#		-suricata		get Suricata data
+#		-type			get a user-specified type of data
+#
+#		-verbose		turn on verbose output
+#		-help			give usage message and exit
+#		-man			show a manual page and exit
+#		-Version		give command version info and exit
+#
+
+allflag = 0			# All-lines flag.
+totalflag = 0			# Total-output flag.
+verbose = 0			# Verbose flag.
+
+alldata	 = 0			# Get-all-data flag.
+cowrie	 = 0			# Get-Cowrie flag.
+fatt	 = 0			# Get-Fatt flag.
+p0f	 = 0			# Get-P0f flag.
+suricata = 0			# Get-Suricata flag.
+utype	 = 0			# Get user-specified-type flag.
+
+debug = 0			# Internal debugging flag.
+
+#------------------------------------------------------------------------
+# Globbies.
+#
+
+NAPTIME = 5			# Seconds to wait for tunnel initialization.
+
+entrycnt = 0			# Count of entries seen.
+				# Nothing is done with this currently.
+
+#------------------------------------------------------------------------
+# Routine:	main()
+#
+# Purpose:	Do everything.
+#
+def main():
+
+	#
+	# Parse our command line.
+	#
+	getopts()
+
+	#
+	# Set up a tunnel to the ElasticSearch engine.
+	#
+	digger(ESENGINE)
+
+	#
+	# Initialize our connection to ElasticSearch.
+	#
+	try:
+		es = esinit()
+	except Exception as exc:
+		print("\nconnection error\n")
+		print(exc)
+		print("")
+		exit(9)
+
+	#
+	# Build our query, depending on the option given.
+	#
+	qstr = getquery_all()
+	if(utype):
+		qstr = getquery(utype)
+
+	elif(cowrie):
+		qstr = getquery('Cowrie')
+
+	elif(fatt):
+		qstr = getquery('Fatt')
+
+	elif(p0f):
+		qstr = getquery('P0f')
+
+	elif(suricata):
+		qstr = getquery('Suricata')
+
+	#
+	# Run our query.
+	#
+	results = getesdata(es, qstr)
+
+	#
+	# Close the tunnel we opened.
+	#
+	closetunnel()
+
+	sys.exit(0)
+
+
+#------------------------------------------------------------------------
+# Routine:	getopts()
+#
+# Purpose:	Parse the command line for options.
+#
+def getopts():
+	global alldata					# Get-all-data flag.
+	global cowrie					# Get-Cowrie flag.
+	global suricata					# Get-Suricata flag.
+	global fatt					# Get-Fatt flag.
+	global p0f					# Get-P0f flag.
+	global utype					# Get user-specified-type flag.
+	global verbose					# Verbose flag.
+
+	#
+	# Build our usage string.
+	#
+	usagestr = usage(0)
+
+	#
+	# Build the options parser.
+	#
+	ap = argparse.ArgumentParser(usage=usagestr, add_help=False)
+
+	#
+	# Add the recognized options.
+	#
+	ap.add_argument('-verbose',  action='store_true')
+	ap.add_argument('-Version',  action='version', version=VERS)
+	ap.add_argument('-help',     action='store_true')
+	ap.add_argument('-man',	     action='store_true')
+
+	ap.add_argument('-cowrie',   action='store_true')
+	ap.add_argument('-fatt',     action='store_true')
+	ap.add_argument('-p0f',      action='store_true')
+	ap.add_argument('-suricata', action='store_true')
+	ap.add_argument('-type')
+
+	#
+	# Now parse the options.
+	#
+	args = ap.parse_args()
+
+	#
+	# Check for some immediate options.
+	#
+	if(args.help):		usage(1)
+	if(args.man):		manpage()
+	if(args.verbose):	verbose = 1
+
+	if(args.cowrie):	cowrie	 = 1
+	if(args.fatt):		fatt	 = 1
+	if(args.p0f):		p0f	 = 1
+	if(args.suricata):	suricata = 1
+	if(args.type):		utype	 = args.type
+
+	#
+	# If no option was chosen, we'll get everything.
+	#
+	if((cowrie   == 0) and
+	   (fatt     == 0) and
+	   (p0f	     == 0) and
+	   (suricata == 0) and
+	   (type     == 0)):
+		alldata = 1
+
+
+#----------------------------------------------------------------------
+# Routine:	esinit()
+#
+# Purpose:	Set up a connection to Elastic.
+#
+def esinit():
+
+	#
+	# Initialize the connection fields.
+	#
+	timer = 30
+	usessl = False
+	vercerts = False
+	authvals=(ESUSER, ESPASS)
+	retrycnt = 10
+	retryflag = True
+
+	esloc = [{'host': 'localhost', 'port': LOCALPORT}]
+
+	#
+	# Make the actual connection.
+	#
+	try:
+
+		es = Elasticsearch(esloc,
+					timeout=timer,
+					use_ssl=usessl,
+					verify_certs=vercerts,
+					http_auth=authvals,
+					max_retries=retrycnt,
+					retry_on_timeout=retryflag)
+
+	except Exception as exc:
+		print("\nunable to connect to %s's ElasticSearch\n" % ESENGINE)
+		print(exc)
+		print("")
+		exit(9)
+
+	#
+	# Give the goods to our caller.
+	#
+	return(es)
+
+
+#----------------------------------------------------------------------
+# Routine:	getesdata()
+#
+# Purpose:	Get a bunch of data from ElasticSearch.
+#
+def getesdata(es, querystr):
+
+	global entrycnt			# Count of entries seen.
+
+	#
+	# Look at all the indices.
+	#
+	idx = "_all"
+
+	try:
+		#
+		# Get the iterator for all the matching queries.
+		#
+		sciter = helpers.scan(es, index=idx, query=querystr)
+#		sciter = helpers.scan(es, index=idx, raise_on_error=False, query=querystr)
+
+		for doc in sciter:
+
+			#
+			# Skip empty documents.
+			#
+			if(doc == {}):
+				continue
+
+			#
+			# Bump the entry counts.
+			#
+			entrycnt += 1
+
+			#
+			# Get and print the document's source field.
+			#
+			if('_source' not in doc):
+				print("\t\t---> _source not in doc!")
+				continue
+
+			src = doc['_source']
+
+#
+# Uncomment these lines (and comment the "print(src)" line) if you want
+# to collect a list of document types.
+#
+#			if('type' in src):
+#				print("%s" % src['type'])
+
+			print(src)
+
+	except Exception as exc:
+		print("\n\ngetesdata:  exception of some sort\n\n")
+		print("\texception:  %s" % exc)
+		print("")
+
+
+#----------------------------------------------------------------------
+# Routine:	getquery()
+#
+# Purpose:	Build a query string given a doc type to find.
+#		Look at getquery_template() for the real query template.
+#
+def getquery(doctype):
+
+	#
+	# This is the collapsed version of a sample query string.  A readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Cowrie"}},{"match":{"eventid" : "cowrie.command.input"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : doctype
+						}
+					}
+				]
+			}
+		}
+	}
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	getquery_all()
+#
+# Purpose:	Template for building an ElasticSearch query.
+#
+def getquery_all():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#
+
+	qstr = ''
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	getquery_cowrie()
+#
+# Purpose:	Build a query to get the command lines from Cowrie input.
+#		Obsolete?
+#
+def getquery_cowrie():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Cowrie"}},{"match":{"eventid" : "cowrie.command.input"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "Cowrie"
+						}
+#					},
+#					{
+#						"match":
+#						{
+#							"eventid" : "cowrie.command.input"
+#						}
+					}
+				]
+			}
+
+		}
+
+#
+# These lines are used if you want to limit the data returned.
+#
+#		},
+#
+#		"_source":
+#		[
+#			"_index",
+#			"@timestamp",
+#			"timestamp",
+#			"src_ip",
+#			"geoip",
+#			"ip_rep",
+#			"session",
+#			"t-pot_hostname",
+#			"t-pot_ip_ext"
+#		]
+
+	}
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	getquery_suricata()
+#
+# Purpose:	Build an ElasticSearch query to retrieve Suricata data.
+#		Obsolete?
+#
+def getquery_suricata():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Suricata"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "Suricata"
+						}
+					}
+				]
+			}
+
+		}
+	}
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	getquery_template()
+#
+# Purpose:	Template for building an ElasticSearch query.
+#
+def getquery_template():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Cowrie"}},{"match":{"eventid" : "cowrie.command.input"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "add-type-here"
+						}
+					},
+				]
+			}
+
+		}
+
+#
+# These lines are used if you want to limit the data returned.
+#
+#		},
+#
+#		"_source":
+#		[
+#			"_index",
+#			"@timestamp",
+#			"timestamp",
+#			"src_ip",
+#			"geoip",
+#			"ip_rep",
+#			"session",
+#			"t-pot_hostname",
+#			"t-pot_ip_ext"
+#		]
+
+	}
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#------------------------------------------------------------------------
+# Routine:	digger()
+#
+# Purpose:	Open a tunnel to the ElasticSearch engine.  If there's
+#		already a tunnel open, we'll close it.  After creating
+#		the new tunnel, we'll wait a few seconds to ensure the
+#		tunnel has completed set-up.
+#
+#		For coarse values of "ensure".
+#
+def digger(ESENGINE):
+
+	closetunnel()
+
+	opentunnel(ESENGINE)
+
+	time.sleep(NAPTIME)
+
+
+#------------------------------------------------------------------------
+# Routine:	closetunnel()
+#
+# Purpose:	Ensures the ssh tunnel is closed.
+#
+def closetunnel():
+
+	#
+	# The command string we'll look for in processes.
+	#
+	sshcmd = 'ssh -fN'
+
+	#
+	# Get a list of running commands.
+	#
+	out = psout(["wax"])
+
+	#
+	# Find and kill the gateway process.
+	#
+	# We'll assume there's only one gateway process running.
+	#
+	for proc in out:
+
+		if(sshcmd in proc):
+
+			atoms = proc.split()
+
+			cpid = int(atoms[0])
+
+			os.kill(cpid, 1)
+
+			return
+
+
+#------------------------------------------------------------------------
+# Routine:	opentunnel()
+#
+# Purpose:	Opens a new ssh tunnel.
+#
+def opentunnel(rmthost):
+
+	rmthost = ESHOST
+
+	if(verbose):
+		print("\n\nconnecting to tunnel host \"%s\"\n" % rmthost)
+
+	sshargv = ["ssh", "-fN", rmthost]
+
+	#
+	# The run the ssh tunnel command in a subprocess.
+	#
+
+	cpid = os.spawnv(os.P_NOWAIT, "/usr/bin/ssh", sshargv)
+
+	return(cpid)
+
+
+
+#------------------------------------------------------------------------
+# Routine:	psout()
+#
+# Purpose:	Runs the ps command with a a given set of arguments.  The
+#		command is run in a subprocess The output the command writes
+#		to stdout is returned in a list.
+#
+def psout(cmdline):
+
+	cmdline.insert(0, '/bin/ps')
+
+	#
+	# Run the caller's command.
+	#
+	try:
+		bout = subprocess.check_output(cmdline)
+
+	#
+	# Handle OSErrors -- most likely an unrecognized command.
+	#
+	except OSError as exc:
+		print(exc.strerror)
+		log(1, "unable to get disk info:  %s" % exc.strerr)
+		exit(1);
+
+	#
+	# Handle CalledProcessErrors -- errors with the program we just ran.
+	#
+	except subprocess.CalledProcessError as exc:
+		retcode = exc.returncode;
+		print(exc.strerror)
+		log(1, "command errors:  %s" % exc.strerr)
+		exit(retcode);
+
+	#
+	# Convert the bytearray into a string, and then split the lines.
+	#
+	out = bout.decode("utf-8")
+	lines = out.splitlines()
+
+	#
+	# Return the converted output to our caller.
+	#
+	return(lines)
+
+
+#----------------------------------------------------------------------
+# Routine:	usage()
+#
+# Purpose:	Do something with the usage message.
+#
+#		If the prtflag parameter is non-zero, we'll print and exit.
+#		If it is zero, we'll just return the string.
+#
+def usage(prtflag):
+
+	#
+	# Set up our usage string.
+	#
+	outstr = """usage:  esdata [options] <tpot-name>
+
+        where [options] are:
+                -cowrie       - get Cowrie data
+                -fatt         - get Fatt data
+                -p0f          - get P0f data
+                -suricata     - get Suricata data
+                -type         - get a user-specified type of data
+
+                -verbose      - give verbose output
+                -Version      - show version and exit
+                -help         - show usage message
+                -man          - show man page and exit
+ """
+
+	#
+	# Just return the output if we aren't to print the usage string.
+	#
+	if(prtflag == 0):
+		return(outstr)
+
+	#
+	# Print the usage string and exit.
+	#
+	print(outstr.rstrip())
+	exit(0)
+
+
+#----------------------------------------------------------------------
+# Routine:	manpage()
+#
+# Purpose:	Print the manpage and exit.
+#
+def manpage():
+	global man
+
+	print(man)
+	sys.exit(0)
+
+
+
+###############################################################################
+
+#------------------------------------------------------------------------
+#
+# Do everything.
+#
+
+if __name__ == '__main__':
+
+	try:
+		sys.exit(main())
+
+	except Exception as exc:
+		print("\nexception of some sort\n")
+		print(exc)
+		print("")
+
+		#
+		# Close the tpot tunnel we opened.
+		#
+		closetunnel()
+
+		exit(31)
+

@@ -1,0 +1,167 @@
+T-Pot Operations: Lessons Learned
+Russ Mundy (mundy@tislabs.com)
+Michael Baer (baerm@tislabs.com)
+September 17, 2021
+
+As part of the GAWSEED research project under the DARPA CHASE program,
+a set of machines running honeypot software were installed to provide
+sources of data for the GAWSEED project. After reviewing potential
+open source candidate projects, the T-Pot project software was
+selected since it provides multiple open source honeypot software
+packages that are integrated into a single ELK based
+package. Additionally, the T-Pot project is being actively supported
+and is updated regularly. The primary distribution point is currently:
+
+<https://github.com/telekom-security/tpotce>.
+
+The focus of this Lessons Learned is on T-Pot operations. The network
+connectivity points can have an effect on the amount of traffic
+received by a T-Pot which, in turn, will impact the amount of
+computing resources needed for reliable T-Pot operation. In this case,
+the network connection points for this research project were on an
+established enterprise research network, a residential ISP network and
+a small business centered network provider.
+
+It is also worth noting that since the intent of the T-Pots was to
+provide data sources that could be analyzed by other systems, there
+was initially no effort to limit the amount that was captured and
+stored by each T-Pot. This decision was revisited after experiencing a
+number unexpected T-Pot system failures.
+
+To minimize the amount of tuning and operational support requirements,
+the T-Pot installations were made from the pre-built ISO image
+available from:
+
+<https://github.com/telekom-security/tpotce/releases>
+
+Although there are several deployment options available, all
+installations were done as virtual machines on VMware ESXi or VMware
+Fusion host systems that met the requirements described in the
+requirements document, see:
+
+<https://github.com/telekom-security/tpotce#requirements>
+
+
+Lesson Learned #1:
+
+The earliest T-Pot deployments had unexpected and irregular failures
+of various components of the T-Pot system. It is worth noting that the
+T-Pot project has provided a very capable but complex system that has
+many components. Multiple T-Pot re-installations were required before
+reliable installations were achieved. Due to this fact alone,
+installing and running a T-Pot on bare hardware would seem to be a
+very poor choice.
+
+RECOMMENDATION: Install and operate T-Pot's as virtual machines. Note
+that snapshots, clones and backups can be incredibly helpful when
+recovering from T-Pot problems.
+
+
+Lesson Learned #2:
+
+Although the specific causes of the early
+deployment failures were not identifiable, increasing the size of
+available T-Pot storage did improve operational reliability of the
+systems. The T-Pot project documentation listed minimum system
+requirements in tpotce#requirements should be considered bare
+minimums, particularly the amount of available storage defined for a
+T-Pot (128GB). All T-Pot installations for the project had at least
+200GB of storage. This proved to be insufficient for the amount of
+traffic received and stored by the project T-Pots.
+
+- The amount of network traffic varied significantly over time and on
+the different T-Pot installations (which impacts the amount of storage
+actually used). Based on network traffic received by our T-Pots, the
+minimum storage for each 30 days of operation should be ~100GB _plus_
+200GB storage to accommodate surge traffic (amount of which cannot be
+predicted).
+
+- The default Elasticsearch installation of T-Pot has the data
+retention time set to 90 days (managed by elasticsearch curator
+package). If sufficient storage is not available for a particular
+T-Pot, the elasticsearch retention time can be changed by editing the
+time setting in:
+
+/opt/tpot/etc/curator/actions.yml
+
+	NOTE 1: if the update.sh is run manually on the T-Pot, the default
+90 day value will be reset for elastic curator so the retention period
+needs to be reset manually after running update.sh.
+
+	NOTE 2: the default T-Pot configuration does automatically check for
+updates on a daily basis and this sometimes (but not always) rests the
+retention to the default 90 day value so if retention time is reset
+from the default, it should be checked regularly to ensure that some
+update has not returned it to the default 90 value.
+
+RECOMMENDATION: If using the default T-Pot configuration, a more
+accurate minimum storage size for reliable T-Pot operation using the
+default configuration should be 500GB (~300GB for 90 'normal' days of
+storage plus 200GB for 'surge' storage).
+- If a T-Pot system is using elasticsearch retention times other than
+the default 90 days, that setting should be checked daily to ensure
+that updates have not reset the value.
+
+
+Lesson Learned #3:
+
+Since T-Pots have many complex and inter related systems, a VM would
+occasionally reach a state where recovery of that T-Pot was not
+practical. In such instances, the failed VM needed to be replaced by a
+new T-Pot VM installation. Although the new T-Pot installation could
+be configured such that it appeared to the Internet to be the same
+T-Pot as the original, the elasticsearch content of failed VM was
+difficult or impossible to recover.
+
+- The solution for this project was to implement an automated system
+to copy elasticsearch data from each T-Pot to a centralized, larger,
+and more robust (i.e. multi-node) elasticsearch system. This provided
+both redundant storage for data as well as the capability to analyze
+all of data collected from multiple T-Pot locations.
+
+RECOMMMENDATION: Provide a capability to store T-Pot collected data on
+a physically separate elasticsearch instance and implement an
+automated daily transfer of data from T-Pot instance(s) to the
+separate elasticsearch instance.
+ 
+ 
+Lesson Learned #4:
+Be prepared for unexpected T-Pot failures. Some failures result from
+overwhelming attacks filling storage or a problem from an automated
+update or unknowable events that result in a T-Pot partially or fully
+failing. In some cases, the reason for failure can be identified and
+perhaps corrected but in other cases, the cause of failure is not
+apparent or correctable.
+
+If this situation arises, the T-Pot installation might be able to be
+rescued by running the update.sh command located at:
+
+/opt/tpot/update.sh
+
+this script ruthlessly updates the T-Pot installation to the latest
+versions of everything that is used for a T-Pot instance.
+
+As cautioned in the project documentation, be sure to have a backup of
+any changes/modifications for that T-Pot installation (e.g. retention
+time), see:
+
+<https://github.com/telekom-security/tpotce#updates>
+
+Although the project documentation makes no claim to this effect, our
+experience found that this update script would sometimes return a
+"broken" T-Pot instance to functionality. Also observed was the fact
+that not all components were always updated with the first running of
+this script. In a few instances, the script needed to run as many as
+four or five times for all of the updates to be installed.
+
+RECOMMMENDATION: If a T-Pot is not performing the normal functions,
+run the tpot update script (multiple times if required) and reboot.
+
+
+Helpful Hint: The T-Pot project documentation clearly states that the
+default installation includes submission of some data to the Community
+site. The documentation also includes instructions on how to disable
+this function if the data from a particular installation should _not_
+be sent to the Community site - see:
+
+https://github.com/telekom-security/tpotce#community-data-submission

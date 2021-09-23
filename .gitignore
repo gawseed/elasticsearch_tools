@@ -1,0 +1,12 @@
+*~
+*.bak
+*.bs
+*.la
+*.lo
+*.o
+*.obj
+*.old
+*.orig
+*.out
+*.rej
+*.swp

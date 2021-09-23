@@ -1,0 +1,1912 @@
+#!/usr/bin/env python3
+#
+# tpoturls-to-kafka	This script finds URLs and URIs in the Tpot honeypot
+#			input collected from a set of Tpot honeypot hosts.
+#			The honeypot data are stored in ElasticSearch indices.
+#
+#	usage:
+#		tpoturls-to-kafka [-... | -help | -Version] <tpot1> ... <tpotN>
+#
+# Revision History
+#	1.0	Initial revision.				210921
+#
+#	Written by Wayne Morrison, 210921.
+#
+
+import os
+import sys
+import time
+
+import argparse
+import subprocess
+import re
+
+from elasticsearch import Elasticsearch
+from elasticsearch import helpers
+from elasticsearch.helpers import scan
+
+import json
+
+from kafka import KafkaProducer
+
+#
+# Version information.
+#
+NAME = "tpoturls-to-kafka"
+VERS = NAME + " version: 1.0"
+
+#------------------------------------------------------------------------
+
+man = '''
+
+NAME
+
+tpoturls-to-kafka - gathers URLs sent to tpot hosts for a Kafka feed
+
+SYNOPSIS
+
+  tpoturls-to-kafka [options] <tpot1> ... <tpotN>
+
+DESCRIPTION
+
+tpoturls-to-kafka gathers URLs sent to a set of Tpot hosts and summarizes the
+data for a Kafka feed.  The Tpot data are stored on a unified Elasticsearch
+engine.  Three honeypots are searched for URL usage:  Cowrie, Suricata, and P0F.
+
+The data stored from each Cowrie record are:
+
+	honeypot ('cowrie')
+	index name
+	time stamp
+	Tpot name
+	IP address of the incoming client
+	reputation of the IP address
+	country code of the IP address
+	session identifier
+	URLs from a Cowrie command line
+
+The data stored from each Suricata record are:
+
+	honeypot ('suricata')
+	index name
+	time stamp
+	IP address of the incoming client
+	reputation of the IP address
+	country code of the IP address
+	URL from Suricata record
+	HTTP method for URL
+	HTTP port
+	User-agent purportedly used to request URL
+
+The data stored from each P0F record are:
+
+	Tpot name
+	honeypot ('p0f')
+	index name
+	time stamp
+	IP address of the incoming client
+	reputation of the IP address
+	country code of the IP address
+	mod:  'http request' or 'http response'
+	subject: 'cli' or 'srv'
+	client application
+	rawsig:  information from the HTTP request
+
+USAGE
+
+tpoturls-to-kafka is assumed to be run on a periodic basis, probably daily.
+With no options, all honeypot URL data from the Elastic server will be sent
+to the Kafka server.  Several options modify this behavior.
+
+The -config option specifies a configuration file.  This file records Tpot
+names, honeypot names, and the last index sent to Kafka for each Tpot/honeypot
+pair.  The config file will be updated to reflect the most recent index
+tpoturls-to-kafka sent to Kafka.  This is expected to be the standard way
+of using tpoturls-to-kafka in a cron job.
+
+The first time tpoturls-to-kafka is run, it should be given an empty config
+file.  As it runs, sending Tpot data to Kafka, the empty config file will be
+filled with relevant data showing progress.  From that point on, using that
+config file will keep submitted data up to date.
+
+The -before option specifies a date limit for indices.  Only indices with a
+date prior to the given date will be sent to Kafka.  The date format is
+YYYY.MM.DD.  So, January 9, 2021 will be given as 2021.01.09.
+
+The -after option specifies a date limit for indices.  Only indices with a
+date after the given date will be sent to Kafka.  The date format is
+YYYY.MM.DD.  So, January 9, 2021 will be given as 2021.01.09.
+
+The -config option may not be used with the -before or -after options.
+
+Either a list of Tpot hostnames or the -all option must be given.  Only
+recognized Tpots will be handled.
+
+
+It is extremely likely that the SSH parameters (e.g., hostnames and ports)
+will have to be modified to fit the environment of the user.
+
+OPTIONS
+
+tpoturls-to-kafka takes the following options:
+
+	-after yyyy.mm.dd
+		Give entries after this date.
+		This date must be before the -before date, if that is given.
+
+	-before yyyy.mm.dd
+		Give entries before this date.
+		This date must be after the -after date, if that is given.
+
+	-config conffile
+		configuration file for tpoturls-to-kafka
+		If the specified file does not exist, an empty file will be
+		created and processing for all Tpots will start from the
+		first index.
+
+	-list
+		Display the list of recognized tpots.
+
+	-tunnel
+		Set up an SSH tunnel for communications.
+
+	-Version
+		Display the version information for tpoturls-to-kafka.
+
+	-help
+		Display a help message.
+
+	-man
+		Display the manual page.
+
+AUTHOR
+
+Wayne Morrison, tewok@tislabs.com
+
+'''
+
+#------------------------------------------------------------------------
+# Info about gateway and kafka hosts.
+#
+
+esengine = 'watermelon'				# tislabs' Elasticsearch engine.
+esengine = 'canary'				# tislabs' Elasticsearch engine.
+
+GWHOST = 'cerberus.netsec'			# Gateway host to tislabs.
+
+PORT = 64290					# Port for Elasticsearch tunnel.
+
+INDICESURL= 'localhost:64290/_cat/indices'	# URL for getting index list.
+
+USER = username 				# Username for ES HTTP access.
+PASS = password 				# Password for ES HTTP access.
+
+#
+# Definitions for talking to Kafka.
+#
+KAFKA_HOST = 'pars-kafka.tislabs.com:9092'
+
+KAFKA_FEED = 'test'
+KAFKA_FEED = 'parsons_gawseed_tpots_urls'
+
+#------------------------------------------------------------------------
+# Option fields.
+#	options handled:
+#		-all		run for all defined tpots
+#		-after		entries after this date
+#		-before		entries before this date
+#		-config		configuration file for tpoturls-to-kafka
+#		-list		list all defined tpots
+#		-man		give man page and exit
+#		-help		give usage message and exit
+#		-verbose	give verbose output
+#		-Version	give command version info and exit
+#
+
+after	 = ''			# All entries after this data.	(-after)
+before	 = ''			# All entries before this data.	(-before)
+compflag = 0			# All-entries flag.		(-complete)
+config	 = ''			# Configuration file.		(-config)
+tunnelflag = ''			# Use an ssh tunnel.		(-tunnel)
+verbose	 = 0			# Verbose flag.			(-verbose)
+
+tpotlist = []		# List of tpots whose Elastic indices will be searched.
+
+debug = 0			# Internal debugging flag.
+debugloc = 0			# Internal debugging flag.
+
+dokafka = 1			# Flag for turning on/off Kafka use.
+
+#------------------------------------------------------------------------
+# Globbies.
+#
+
+NAPTIME = 5			# Seconds to wait for tunnel initialization.
+
+
+FIRST	= '0000.00.00'		# Impossible timestamp of first post.
+LAST	= '9999.99.99'		# Impossible timestamp of last post.
+
+
+#
+# Tpots whose data we may retrieve.
+# These should be defined in the .ssh/config file.
+#
+known_tpots = [
+		'tpot',
+		'tpot2',
+		'tpot3',
+		'tpot4'
+	      ]
+
+#
+# Honeypots whose data we may retrieve.
+#
+known_hpots = [
+		'cowrie',
+		'suricata',
+		'p0f'
+	      ]
+
+#
+# Date of last entry we post for each tpot.
+#
+lastdates = dict()
+
+#
+# These are counts and summaries for individual tpots.
+#
+entrycnt = 0					# Count of entries seen.
+urlcnt   = 0					# Count of URLs.
+urllinescnt = 0					# Count of lines with URLs.
+
+
+#
+# These are the overall counts and summaries.
+#
+all_entrycnt = 0				# Count of all entries seen.
+all_urlcnt   = 0				# Count of all URLs.
+all_urllinescnt = 0				# Count of lines with URLs.
+
+allurls = dict()				# All URLs found.
+
+#
+# Kafka producer object.
+#
+kafprod = None
+
+
+#
+# Name of an index's tpot.
+#
+idx2tpot = dict()
+
+#
+# Original stdout.
+#
+origout = None
+
+#
+# Value for missing fields.
+#
+MISSING = '<<< missing >>>'
+
+#------------------------------------------------------------------------
+# Routine:	main()
+#
+# Purpose:	Do shtuff.
+#
+def main():
+	global kafprod				# Kafka producer.
+	global urlcnt				# Count of URLs.
+	global urllinescnt			# Count of lines with URLs.
+	global origout				# Original stdout.
+
+	global debugloc				# Internal debugging flag.
+
+	#
+	# Parse our command line.
+	#
+	getopts()
+
+	if(config == ''):
+		print("\nno config file specified\n")
+	elif(config == None):
+		print("\nnone config file specified\n")
+#	else:
+#		print("\nwriting new config file:  %s\n" % config)
+		
+	origout = sys.stdout
+
+	#
+	# Set up a tunnel to the Elasticsearch engine.
+	#
+	digger(esengine)
+
+	#
+	# Get the indices to search.
+	#
+	indices = getindices()
+
+	#
+	# Initialize our connection to the Elasticsearch engine.
+	#
+	es = esinit()
+
+	#
+	# Build our query strings.
+	#
+	debugloc = 1
+	qcowrie = cowrie_query()
+	qsuricata = suricata_query()
+	qp0f = p0f_query()
+	debugloc = 2
+
+	#
+	# Initialize our connection to the Kafka engine.
+	#
+	if(dokafka):
+		kafprod = KafkaProducer(value_serializer=lambda v: json.dumps(v).encode('utf-8'), bootstrap_servers=KAFKA_HOST)
+
+		origout.write("sending to feed %s on %s\n" % (KAFKA_FEED, KAFKA_HOST))
+	else:
+		print("not sending tpot entries to kafka\n")
+
+	origout.write("\n\nreading indices:\n")
+	debugloc = 3
+	for idxfile in indices:
+
+		curtpot = idx2tpot[idxfile]
+
+#		origout.write("%08s\t%s\n" % (curtpot, idxfile))
+
+		#
+		# Open this index's output file.
+		#
+		outfn = "out.urls.%s" % curtpot
+		sys.stdout = open(outfn, 'a')
+
+		#
+		# Reset our per-tpot statistics.
+		#
+		urlcnt	    = 0
+		urllinescnt = 0
+
+		#
+		# Run our queries.
+		#
+		cowrie_urls(es, curtpot, idxfile, qcowrie)
+		suricata_urls(es, curtpot, idxfile, qsuricata)
+		p0f_urls(es, curtpot, idxfile, qp0f)
+
+
+		sys.stdout.close()
+
+	debugloc = 4
+
+	#
+	# Close the tpot tunnel we opened.
+	#
+	closetunnel()
+
+	#
+	# Save the config values once more, just to be sure.
+	#
+	newconfig()
+
+	sys.exit(0)
+
+
+#------------------------------------------------------------------------
+# Routine:	getopts()
+#
+# Purpose:	Parse the command line for options.
+#
+def getopts():
+	global tpotlist				# Name of tpot to contact.
+	global compflag				# -complete option given.
+	global after				# -after option.
+	global before				# -before option.
+	global config				# -config option.
+	global tunnelflag			# -tunnel option.
+	global verbose				# -verbose flag.
+
+	#
+	# Build our usage string.
+	#
+	usagestr = usage(0)
+
+	#
+	# Build the options parser.
+	#
+	ap = argparse.ArgumentParser(usage=usagestr, add_help=False)
+
+	#
+	# Add the recognized options.
+	#
+	ap.add_argument('-Version',  action='version', version=VERS)
+	ap.add_argument('-help',     action='store_true')
+	ap.add_argument('-verbose',  action='store_true')
+	ap.add_argument('-man',      action='store_true')
+
+
+	ap.add_argument('-all',	     action='store_true')
+	ap.add_argument('-complete', action='store_true')
+	ap.add_argument('-list',     action='store_true')
+	ap.add_argument('-tunnel',   action='store_true')
+
+	ap.add_argument('-after')
+	ap.add_argument('-before')
+	ap.add_argument('-config')
+
+	ap.add_argument('tpotlist',  nargs='*')
+
+	#
+	# Now parse the options.
+	#
+	args = ap.parse_args()
+
+	#
+	# Check for some immediate options.
+	#
+	if(args.help):		usage(1)
+	if(args.man):		manpage()
+	if(args.verbose):	verbose	   = 1
+	if(args.complete):	compflag   = 1
+	if(args.tunnel):	tunnelflag = 1
+
+	#
+	# If the list argument was given, list the known tpots and exit.
+	#
+	if(args.list):
+		for tpot in sorted(known_tpots):
+			print(tpot)
+		exit(0)
+
+	#
+	# -config is mutually exclusive from -before and -after.
+	#
+	if(args.config and (args.after or args.before)):
+		if(args.after and args.before):
+			print("-config may not be used with -before and -after")
+		elif(args.after):
+			print("-config may not be used with -after")
+		elif(args.before):
+			print("-config may not be used with -before")
+		exit(1)
+
+	#
+	# Check for the -config option and read it.
+	#
+	if(args.config):
+		config = args.config
+		if(verbose):
+			print("using configuration file %s" % config)
+
+		readconfig(config)
+
+	#
+	# Check for the -after option and validate its value.
+	#
+	if(args.after):
+		after = args.after
+
+		aftpat = r'^\d{4}\.\d{2}\.\d{2}$'
+
+		match = re.search(aftpat, after)
+		if(match == None):
+			print("invalid -after option, must be \"YYYY.MM.DD\"")
+			exit(3)
+
+		if(verbose):
+			print("looking for indices after %s" % after)
+
+	#
+	# Check for the -before option and validate its value.
+	#
+	if(args.before):
+		before = args.before
+
+		befpat = r'^\d{4}\.\d{2}\.\d{2}$'
+
+		match = re.search(befpat, before)
+		if(match == None):
+			print("invalid -before option, must be \"YYYY.MM.DD\"")
+			exit(3)
+
+		if(verbose):
+			print("looking for indices before %s" % before)
+
+	#
+	# Ensure that after date is before before date, if both were given.
+	#
+	if(before and after):
+		if(after >= before):
+			print("-after date (%s) must be before -before date (%s)" % (after, before))
+			exit(3)
+
+	#
+	# If -complete is given, then after and before dates are ignored.
+	#
+	if(compflag):
+		after = FIRST
+		before = LAST
+
+	#
+	# Set up the tpot list.
+	#
+	if(args.all):
+		tpotlist = known_tpots
+	else:
+		if(args.tpotlist):
+			tpotlist = args.tpotlist
+		else:
+			usage(1)
+
+	#
+	# Convert "tpot1" references to "tpot".
+	#
+	for ind in range(0, len(tpotlist)):
+		if(tpotlist[ind] == 'tpot1'):
+			tpotlist[ind] = 'tpot'
+
+	if(verbose):
+		print("tpotlist  - %s" % tpotlist)
+		print("")
+
+
+#----------------------------------------------------------------------
+# Routine:	esinit()
+#
+# Purpose:	Initialize some Elasticsearch fields.
+#
+def esinit():
+
+	#
+	# Set up a connection to Elastic.
+	#
+
+	urlpfxstr = "es"
+
+	try:
+		esloc = [{'host': 'localhost', 'port': PORT}]
+
+		timer = 30
+		usessl = False
+		vercerts = False
+		authvals=(USER, PASS)
+		retrycnt = 10
+		retryflag = True
+
+		es = Elasticsearch(esloc,
+					timeout=timer,
+					use_ssl=usessl,
+					verify_certs=vercerts,
+					http_auth=authvals,
+					max_retries=retrycnt,
+					retry_on_timeout=retryflag)
+
+# curl -s -X GET localhost:64290/tpot-logstash-2020.08.23
+
+
+	except Exception as exc:
+		print("\nunable to connect to %s's Elasticsearch\n" % esengine)
+		print(exc)
+		print("")
+		exit(9)
+
+	#
+	# Give the goods to our caller.
+	#
+	return(es)
+
+
+#----------------------------------------------------------------------
+# Routine:	cowrie_query()
+#
+# Purpose:	Build the query for Cowrie URLs.
+#
+def cowrie_query():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Cowrie"}},{"match":{"eventid" : "cowrie.command.input"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "Cowrie"
+						}
+					},
+					{
+						"match":
+						{
+							"eventid" : "cowrie.command.input"
+						}
+					}
+				]
+			}
+		},
+
+		"_source":
+		[
+			"_index",
+			"@timestamp",
+			"timestamp",
+			"src_ip",
+			"geoip",
+			"ip_rep",
+			"input",
+			"session",
+			"t-pot_hostname",
+			"t-pot_ip_ext"
+		]
+	}
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	cowrie_urls()
+#
+# Purpose:	Get URL data from Cowrie command data.
+#
+def cowrie_urls(es, tpotname, idx, querystr):
+
+	global entrycnt				# Count of entries seen.
+	global urlcnt				# Count of URLs.
+	global urllinescnt			# Count of lines with URLs.
+	global all_entrycnt			# Count of all entries seen.
+	global all_urlcnt			# Count of all URLs.
+	global all_urllinescnt			# Count of lines with URLs.
+
+	entries = list()
+	uniqurls = list()
+	uniqcmds = list()
+
+	origout.write("%-8s\t%-8s\t%s\n" % (tpotname, 'cowrie', idx))
+
+	try:
+		#
+		# Get the iterator for all the matching queries.
+		#
+		sciter = helpers.scan(es, index=idx, query=querystr)
+#		sciter = helpers.scan(es, index=idx, raise_on_error=False, query=querystr)
+
+		for doc in sciter:
+
+			#
+			# Skip empty documents.
+			#
+			if(doc == {}):
+				continue
+
+			#
+			# Ensure this doc has a _source field.
+			#
+			if('_source' not in doc):
+				print("\t\t---> _source not in doc!")
+				continue
+			src = doc['_source']
+
+			#
+			# Get shortcuts for the fields we've fetched.
+			#
+
+			chron = MISSING
+			if('timestamp' in src):
+				chron = src['timestamp']
+
+			cmdline = MISSING
+			if('input' in src):
+				cmdline = src['input']
+
+			countrycode2 = MISSING
+			if('geoip' in src):
+				geoip = src['geoip']
+
+				if('country_code2' in geoip):
+					countrycode2 = geoip['country_code2']
+
+			session = MISSING
+			if('session' in src):
+				session = src['session']
+
+			srcip = MISSING
+			if('src_ip' in src):
+				srcip = src['src_ip']
+
+			iprep = MISSING
+			if('ip_rep' in src):
+				iprep = src['ip_rep']
+
+			#
+			# Bump the entry counts.
+			#
+			entrycnt     += 1
+			all_entrycnt += 1
+
+
+
+			if(len(cmdline) == 0):
+				cmdline = '(empty command line)'
+
+
+			#
+			# Add any URLs on the command line to our list of unique URLs.
+			#
+			uripat = r'([a-zA-Z][\w+.-]+://\S+)'
+			urimatch = re.findall(uripat, cmdline)
+			if(urimatch != []):
+
+				urllinescnt += 1
+
+				#
+				# Build a list of unique URL that were on this
+				# line.  Trailing semis are removed.
+				#
+				for u in urimatch:
+					u = re.sub(r';$', '', u)
+					if(u not in uniqurls):
+						uniqurls.append(u)
+
+				if(cmdline not in uniqcmds):
+					uniqcmds.append(cmdline)
+
+				#
+				# Bump the relevant counts and add this to our output
+				# for this line.
+				#
+				all_urllinescnt += 1
+				all_urlcnt += len(uniqurls)
+
+
+			#
+			# We'll add the URLs and command data to our set of Kafka entries.
+			#
+			if(len(uniqurls) > 0):
+
+				fields = dict()
+
+				fields['honeypot'] = 'cowrie'
+				fields['index']    = idx
+				fields['time']	   = chron
+				fields['tpot']	   = tpotname
+				fields['srcip']	   = srcip
+				fields['iprep']    = iprep
+				fields['countrycode2']	= countrycode2
+				fields['session']  = session
+				fields['urls']	   = uniqurls
+
+				entries.append(fields)
+
+				if(0):
+					print("tpot              <%s>" % fields['tpot'])
+					print("honeypot          <%s>" % fields['honeypot'])
+					print("index             <%s>" % fields['index'])
+					print("session           <%s>" % fields['session'])
+					print("time              <%s>" % fields['time'])
+					print("srcip             <%s>" % fields['srcip'])
+					print("ip_rep            <%s>" % fields['iprep'])
+					print("urls              <%s>" % fields['urls'])
+					print("geoip.countrycode <%s>" % fields['countrycode2'])
+
+					print("\n")
+
+			#
+			# Put this index as the tpot's new last date.
+			#
+			match = re.search(r'logstash-(.+)', idx)
+			if(match != None):
+				newlast = match.group(1)
+				addconf(tpotname, 'cowrie', newlast)
+
+	except Exception as exc:
+		print("\texception:  %s" % exc)
+		print("\nhandling index %s\n" % idx)
+		print("")
+
+		closetunnel()
+		exit(20)
+
+	#
+	# Send this index' data to Kafka.
+	#
+	try:
+		if(dokafka):
+			if(len(entries) > 0):
+				print("\nsending %d cowrie entries to kafka\n" % len(entries))
+				kafprod.send(KAFKA_FEED, entries)
+			else:
+				print("\nnot sending 0 cowrie entries to kafka\n")
+
+		else:
+			print("\nnot sending cowrie entries to kafka\n")
+
+	except Exception as exc:
+		print("\nunable to send index %s to kafka\n" % idx)
+		print("\texception:  %s" % exc)
+		print("")
+
+		closetunnel()
+		exit(21)
+
+	#
+	# Save the new date to the configuration file.
+	#
+	newconfig()
+	if(verbose):  print("index written:  %s" % idx)
+
+	#
+	# Probably can get rid of this section of code.
+	#
+	if(0):
+
+		#
+		# If we found any URLs in this index, we'll provide them now.
+		#
+		if(len(uniqurls) > 0):
+
+			print("\nURLs in index:")
+			for u in uniqurls:
+				print("<%s>" % u)
+				urlcnt += 1
+
+			print("\ncommand lines with URLs:")
+			for c in uniqcmds:
+				print("<%s>" % c)
+
+		if(len(entries) > 0):
+			sectionizer(idx)
+			print(entries)
+
+
+#----------------------------------------------------------------------
+# Routine:	suricata_query()
+#
+# Purpose:	Build an ElasticSearch query to retrieve Suricata data.
+#
+def suricata_query():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Suricata"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "Suricata"
+						}
+					},
+					{
+						"match":
+						{
+							"event_type" : "http"
+						}
+					}
+				]
+			}
+
+		},
+
+		"_source":
+		[
+			"_index",
+			"@timestamp",
+			"timestamp",
+			"src_ip",
+			"geoip",
+			"http",
+			"ip_rep",
+			"t-pot_hostname",
+			"t-pot_ip_ext"
+		]
+	}
+
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	suricata_urls()
+#
+# Purpose:	Get URL data from Suricata data.
+#
+def suricata_urls(es, tpotname, idx, querystr):
+
+	global entrycnt				# Count of entries seen.
+	global urlcnt				# Count of URLs.
+	global urllinescnt			# Count of lines with URLs.
+	global all_entrycnt			# Count of all entries seen.
+	global all_urlcnt			# Count of all URLs.
+	global all_urllinescnt			# Count of lines with URLs.
+
+	entries = list()
+	uniqcmds = list()
+
+	origout.write("%-8s\t%-8s\t%s\n" % (tpotname, 'suricata', idx))
+
+	try:
+		#
+		# Get the iterator for all the matching queries.
+		#
+		sciter = helpers.scan(es, index=idx, query=querystr)
+#		sciter = helpers.scan(es, index=idx, raise_on_error=False, query=querystr)
+
+		for doc in sciter:
+
+			#
+			# Skip empty documents.
+			#
+			if(doc == {}):
+				continue
+
+			#
+			# Ensure this doc has a _source field.
+			#
+			if('_source' not in doc):
+				print("\t\t---> _source not in doc!")
+				continue
+			src = doc['_source']
+
+#			print(src, "\n")
+#			continue
+
+			#
+			# Set "missing" fields for missing data.
+			#
+			src['_index'] = doc['_index']
+			for key in ('_index', '@timestamp', 'timestamp', 'src_ip', 'ip_rep', 'http', 't-pot_hostname', 't-pot_ip_ext'):
+				if(key not in src):
+					src[key] = MISSING
+
+			#
+			# Get shortcuts for the fields we've fetched.
+			#
+			indexname = src['_index']
+			chron	  = src['timestamp']
+			srcip	  = src['src_ip']
+			iprep	  = src['ip_rep']
+
+			#
+			# Get the geographical data.
+			#
+			countrycode2 = MISSING
+			if('geoip' in src):
+				geoip = src['geoip']
+				if('country_code2' in geoip):
+					countrycode2 = geoip['country_code2']
+
+			#
+			# Get the URL data.
+			#
+			httpdata = src['http']
+
+			url = MISSING
+			if('url' in httpdata):
+				url = httpdata['url']
+
+			method = MISSING
+			if('http_method' in httpdata):
+				method = httpdata['http_method']
+
+			httpport = MISSING
+			if('http_port' in httpdata):
+				httpport = httpdata['http_port']
+
+			usragent = MISSING
+			if('http_user_agent' in httpdata):
+				usragent = httpdata['http_user_agent']
+
+			if(0):
+				print("tpot              <%s>" % tpotname)
+				print("honeypot         suricata")
+				print("_index           <%s>" % indexname)
+				print("timestamp        <%s>" % chron)
+				print("src_ip           <%s>" % srcip)
+				print("ip_rep           <%s>" % iprep)
+				if('url' not in httpdata):
+					print("httpdata         <%s>" % httpdata)
+				else:
+					print("http-url         <%s>" % url)
+					print("http-method      <%s>" % method)
+					print("http-port        <%s>" % httpport)
+					print("http-user-agent  <%s>" % usragent)
+				print("geoip.countrycode <%s>" % countrycode2)
+
+				print("\n")
+
+#			continue
+
+			#
+			# Bump the entry counts.
+			#
+			entrycnt     += 1
+			all_entrycnt += 1
+
+
+			#
+			# Build the entry for Kafka and save it with the others.
+			#
+			fields = dict()
+
+			fields['tpot']	   = tpotname
+			fields['honeypot'] = 'suricata'
+			fields['index']    = idx
+			fields['time']	   = chron
+			fields['srcip']	   = srcip
+			fields['ip_rep']   = iprep
+			fields['countrycode2']	= countrycode2
+
+			if('url' not in httpdata):
+				fields['http'] = httpdata
+			else:
+				fields['http-url']	  = url
+				fields['http-method']	  = method
+				fields['http-port']	  = httpport
+				fields['http-user-agent'] = usragent
+
+			entries.append(fields)
+
+
+			if(1):
+				#
+				# Put this index as the tpot's new last date.
+				#
+				match = re.search(r'logstash-(.+)', idx)
+				if(match != None):
+					newlast = match.group(1)
+					addconf(tpotname, 'suricata', newlast)
+
+	except Exception as exc:
+		print("\texception:  %s" % exc)
+		print("\nhandling index %s\n" % idx)
+		print("")
+
+		closetunnel()
+		exit(20)
+
+	#
+	# Send this index' data to Kafka.
+	#
+	try:
+		if(dokafka):
+			if(len(entries) > 0):
+				print("\nsending %d suricata entries to kafka\n" % len(entries))
+				kafprod.send(KAFKA_FEED, entries)
+			else:
+				print("\nnot sending 0 suricata entries to kafka\n")
+		else:
+			print("\nnot sending suricata entries to kafka\n")
+
+	except Exception as exc:
+		print("\nunable to send index %s to kafka\n" % idx)
+		print("\texception:  %s" % exc)
+		print("")
+
+		closetunnel()
+		exit(21)
+
+	#
+	# Save the new date to the configuration file.
+	#
+	newconfig()
+	if(verbose):  print("index written:  %s" % idx)
+
+
+	if(0):
+		if(len(entries) > 0):
+			sectionizer(idx)
+			print(entries)
+
+
+#----------------------------------------------------------------------
+# Routine:	p0f_query()
+#
+# Purpose:	Build an ElasticSearch query to retrieve P0f data.
+#
+def p0f_query():
+
+	#
+	# This is the collapsed version of the query string.  The readable
+	# version follows.
+	#
+	#		qstr = {"query":{"bool":{"must":[{"match":{"type" : "Suricata"}}]}}}
+	#
+
+	qstr = {
+		"query":
+		{
+			"bool":
+			{
+				"must":
+				[
+					{
+						"match":
+						{
+							"type" : "P0f"
+						}
+					},
+					{
+						"match":
+						{
+							"mod"  : "http request"
+						}
+					}
+				]
+			}
+
+		},
+
+		"_source":
+		[
+			"_index",
+			"@timestamp",
+			"timestamp",
+			"src_ip",
+			"geoip",
+			"mod",
+			"subject",
+			"app",
+			"raw_sig",
+			"ip_rep",
+			"t-pot_hostname",
+			"t-pot_ip_ext"
+		]
+	}
+
+
+	#
+	# Give the goods to our caller.
+	#
+	return(qstr)
+
+
+#----------------------------------------------------------------------
+# Routine:	p0f_urls()
+#
+# Purpose:	Get URL data from P0f data.
+#
+def p0f_urls(es, tpotname, idx, querystr):
+
+	global entrycnt				# Count of entries seen.
+	global urlcnt				# Count of URLs.
+	global urllinescnt			# Count of lines with URLs.
+	global all_entrycnt			# Count of all entries seen.
+	global all_urlcnt			# Count of all URLs.
+	global all_urllinescnt			# Count of lines with URLs.
+
+	entries = list()
+	uniqcmds = list()
+
+	origout.write("%-8s\t%-8s\t%s\n" % (tpotname, 'p0f', idx))
+
+	try:
+		#
+		# Get the iterator for all the matching queries.
+		#
+		sciter = helpers.scan(es, index=idx, query=querystr)
+#		sciter = helpers.scan(es, index=idx, raise_on_error=False, query=querystr)
+
+		for doc in sciter:
+
+			#
+			# Skip empty documents.
+			#
+			if(doc == {}):
+				continue
+
+			#
+			# Ensure this doc has a _source field.
+			#
+			if('_source' not in doc):
+				print("\t\t---> _source not in doc!")
+				continue
+			src = doc['_source']
+
+			#
+			# Use a dummy mod value if it isn't there.
+			#
+			if('mod' not in src):
+				src['mod'] = MISSING
+
+			#
+			# Skip any non-HTTP lines.
+			#
+			if((src['mod'] != 'http request') and
+			   (src['mod'] != 'http response')):
+			   	continue
+
+#			print(src, "\n")
+#			continue
+
+
+			#
+			# Set "missing" fields for missing data.
+			#
+			src['_index'] = doc['_index']
+			for key in ('_index', '@timestamp', 'timestamp', 'src_ip', 'geoip', 'subject', 'app', 'raw_sig', 'ip_rep', 't-pot_hostname', 't-pot_ip_ext'):
+				if(key not in src):
+					src[key] = MISSING
+
+			#
+			# Get shortcuts for the fields we've fetched.
+			#
+			indexname = src['_index']
+			chron	  = src['@timestamp']
+			srcip	  = src['src_ip']
+			iprep	  = src['ip_rep']
+			mod	  = src['mod']
+			subject	  = src['subject']
+			app	  = src['app']
+			rawsig	  = src['raw_sig']
+
+			#
+			# Get the geographical data.
+			#
+			countrycode2 = MISSING
+			if('geoip' in src):
+				geoip = src['geoip']
+				if('country_code2' in geoip):
+					countrycode2 = geoip['country_code2']
+
+			if(0):
+				print("tpot              <%s>" % tpotname)
+				print("honeypot          p0f")
+				print("_index            <%s>" % indexname)
+				print("timestamp         <%s>" % chron)
+				print("src_ip            <%s>" % srcip)
+				print("ip_rep            <%s>" % iprep)
+				print("geoip.countrycode <%s>" % countrycode2)
+				print("mod	         <%s>" % mod)
+				print("subject	         <%s>" % subject)
+				print("app	         <%s>" % app)
+				print("rawsig	         <%s>" % rawsig)
+
+				print("\n")
+
+
+			#
+			# Bump the entry counts.
+			#
+			entrycnt     += 1
+			all_entrycnt += 1
+
+
+			#
+			# Build the entry for Kafka and save it with the others.
+			#
+			fields = dict()
+
+			fields['tpot']	   = tpotname
+			fields['honeypot'] = 'p0f'
+			fields['index']    = idx
+			fields['time']	   = chron
+			fields['srcip']	   = srcip
+			fields['ip_rep']   = iprep
+			fields['mod']	   = mod
+			fields['subject']  = subject
+			fields['app']	   = app
+			fields['rawsig']   = rawsig
+			fields['countrycode2']	= countrycode2
+
+			entries.append(fields)
+
+
+			if(1):
+				#
+				# Put this index as the tpot's new last date.
+				#
+				match = re.search(r'logstash-(.+)', idx)
+				if(match != None):
+					newlast = match.group(1)
+					addconf(tpotname, 'p0f', newlast)
+
+	except Exception as exc:
+		print("\texception:  %s" % exc)
+		print("\nhandling index %s\n" % idx)
+		print("")
+
+		closetunnel()
+		exit(20)
+
+	#
+	# Send this index' data to Kafka.
+	#
+	try:
+		if(dokafka):
+			if(len(entries) > 0):
+				print("\nsending %d p0f entries to kafka\n" % len(entries))
+				kafprod.send(KAFKA_FEED, entries)
+			else:
+				print("\nnot sending 0 p0f entries to kafka\n")
+		else:
+			print("\nnot sending p0f entries to kafka\n")
+
+	except Exception as exc:
+		print("\nunable to send index %s to kafka\n" % idx)
+		print("\texception:  %s" % exc)
+		print("")
+
+		closetunnel()
+		exit(21)
+
+	#
+	# Save the new date to the configuration file.
+	#
+	newconfig()
+	if(verbose):  print("index written:  %s" % idx)
+
+
+	if(0):
+		if(len(entries) > 0):
+			sectionizer(idx)
+			print(entries)
+
+
+#------------------------------------------------------------------------
+# Routine:	readconfig()
+#
+# Purpose:	Read and handle a configuration file.
+#
+def readconfig(conffile):
+
+	global lastdates	# Last date posted for tpots for the honeypots.
+
+	global debugloc				# Internal debugging flag.
+
+	debugloc = 1
+
+	#
+	# Start all tpots with the last dates at The Depths Of Time.
+	#
+	for tp in known_tpots:
+
+		debugloc = 2
+
+		lastdates[tp] = dict()
+
+		debugloc = 3
+
+		for hp in known_hpots:
+			lastdates[tp][hp] = '0000.00.00'
+
+		debugloc = 4
+
+	#
+	# Ensure the config file exists.
+	# If it doesn't, we'll create an empty config file.
+	#
+	try:
+
+		debugloc = 5
+		os.stat(conffile)
+		debugloc = 6
+	except Exception as exc:
+		fn = open(conffile, 'w')
+		fn.close()
+
+	debugloc = 7
+
+	#
+	# Read config data.
+	#
+	try:
+		fn = open(conffile, 'rU')
+		conflines = fn.readlines()
+		fn.close()
+
+		#
+		# Handle each line, adding it to the lastdates dict.
+		#
+		for ln in conflines:
+			#
+			# Skip blank lines and comments.
+			#
+			if(re.search(r'^\s*#', ln) == True):
+				continue
+
+			match = re.search(r'^(\S+)\s+(\S+)\s+(\S+)\s+(.*)', ln)
+			if(match == None):
+				print("unrecognized configuration line:  \"%s\"" % ln)
+				continue
+
+			#
+			# Get the pieces of the config line.
+			#
+			key  = match.group(1)
+			tpot = match.group(2)
+			hpot = match.group(3)
+			kron = match.group(4)
+#			print("---> <%s>\t<%s>\t<%s>\t<%s>" % (key, tpot, hpot, kron))
+
+			#
+			# If this is the date of the last Kafka post,
+			# save the date in the lastdates dict.
+			#
+			if(key == 'lastpost'):
+				lastdates[tpot][hpot] = kron
+				key = ''
+
+		if(verbose):
+			print("last dates:")
+			for tp in sorted(lastdates):
+				entries = lastdates[tp]
+				for hp in entries:
+					print("\t%-30s\t%-10s\t%s" % (tp, hp, entries[hp]))
+			print("\n")
+
+	except Exception as exc:
+		print("unable to read config file \"%s\"" % conffile)
+		print(exc)
+		exit(4)
+
+	debugloc = 0
+
+
+#------------------------------------------------------------------------
+# Routine:	addconf()
+#
+# Purpose:	Add a new entry to the configuration file.
+#
+def addconf(tpotname, hpotname, newlast):
+
+	global lastdates	# Last date posted for tpots for the honeypots.
+
+	if(tpotname not in lastdates):
+		lastdates[tpotname] = dict()
+		lastdates[tpotname][hpotname] = '0000.00.00'
+
+	if(newlast > lastdates[tpotname][hpotname]):
+		lastdates[tpotname][hpotname] = newlast
+
+
+#------------------------------------------------------------------------
+# Routine:	newconfig()
+#
+# Purpose:	Write a new configuration file.
+#		The data in the lastdates dict are written to the file.
+#
+def newconfig():
+
+	try:
+		if(config == ''):
+			if(verbose):
+				origout.write("\n\nno config file specified\n\n")
+			return
+			
+		if(verbose):
+			origout.write("\nwriting new config file:  %s\n" % config)
+		ldout = open(config, 'w')
+		for tp in lastdates:
+			entries = lastdates[tp]
+#			ldout.write("\n\ntp - <%s>\t<%s>\t%s\n" % (tp, entries, type(entries)))
+			for hp in entries:
+				ldout.write("lastpost\t%s\t%s\t%s\n" % (tp, hp, entries[hp]))
+		ldout.close()
+
+	except Exception as exc:
+		origout.write("error writing new config file:  %s" % config)
+		origout.write(exc.strerror)
+		exit(1);
+
+
+#------------------------------------------------------------------------
+# Routine:	digger()
+#
+# Purpose:	Open a tunnel to the Elasticsearch engine.  If there's
+#		already a tunnel open, we'll close it.  After creating
+#		the new tunnel, we'll wait a few seconds to ensure the
+#		tunnel has completed set-up.
+#
+#		For coarse values of "ensure".
+#
+def digger(esengine):
+
+	if(tunnelflag == 0):
+		return
+
+	closetunnel()
+
+	opentunnel(esengine)
+
+	time.sleep(NAPTIME)
+
+
+#------------------------------------------------------------------------
+# Routine:	closetunnel()
+#
+# Purpose:	Ensures the ssh tunnel is closed.
+#
+def closetunnel():
+
+	if(tunnelflag == 0):
+		return
+
+	#
+	# The command string we'll look for in processes.
+	#
+	sshcmd = 'ssh -fN'
+
+	#
+	# Get a list of running commands.
+	#
+	out = psout(["wax"])
+
+	#
+	# Find and kill the gateway process.
+	#
+	# We'll assume there's only one gateway process running.
+	#
+	for proc in out:
+
+		if(sshcmd in proc):
+
+			atoms = proc.split()
+
+			cpid = int(atoms[0])
+
+			os.kill(cpid, 1)
+
+			return
+
+
+#------------------------------------------------------------------------
+# Routine:	opentunnel()
+#
+# Purpose:	Opens a new ssh tunnel.
+#
+def opentunnel(rmthost):
+
+	if(tunnelflag == 0):
+		return
+
+	rmthost = GWHOST
+
+	print("\nconnecting to tunnel host \"%s\"\n" % rmthost)
+
+	sshargv = ["ssh", "-fN", rmthost]
+
+	#
+	# The run the ssh tunnel command in a subprocess.
+	#
+
+	cpid = os.spawnv(os.P_NOWAIT, "/usr/bin/ssh", sshargv)
+
+	return(cpid)
+
+
+#------------------------------------------------------------------------
+# Routine:	getindices()
+#
+# Purpose:	Gets a list of tpot indices from Elastic.
+#
+def getindices():
+
+	global idx2tpot				# Name of an index' tpot.
+	global after				# -after date.
+	global before				# -before date.
+
+	global debugloc
+
+	debugloc = 80
+	lines = []
+	ln = list()
+
+	print("getting tpot indices from Elastic on %s\n" % esengine)
+
+	#
+	# Default to looking at the whole range of time.
+	#
+	if(after == ''):
+		after = FIRST
+	if(before == ''):
+		before = LAST
+
+	if(verbose):
+		print("after  - %s" % after)
+		print("before - %s" % before)
+		print("\n")
+
+	#
+	# Run the caller's command.
+	#
+	try:
+
+		cmdline = ['curl', '-s', '-X', 'GET', INDICESURL]
+
+		bout = subprocess.check_output(cmdline)
+
+	#
+	# Handle OSErrors -- most likely an unrecognized command.
+	#
+	except OSError as exc:
+		print("unable to get list of indices; invalid command \"%s\"?\n" % ' '.join(cmdline))
+		print(exc.strerror)
+		exit(1);
+
+	#
+	# Handle CalledProcessErrors -- errors with the program we just ran.
+	#
+	except subprocess.CalledProcessError as exc:
+		print("unable to get list of indices; is gateway %s enabled?\n" % GWHOST)
+		retcode = exc.returncode;
+		print("\n\ncommand \"%s\"\n" % ' '.join(cmdline))
+		exit(retcode);
+
+	#
+	# Convert the command output into a string, and then split the lines.
+	#
+	out = bout.decode("utf-8")
+	for ln in sorted(out.splitlines()):
+		debugloc = 81
+
+		#
+		# Set up the pattern to find the index names.
+		#
+		fnpat = r'^\S+\s+\S+\s+(\S+)\s+'
+#		origout.write("ln - <%s>\n" % ln)
+#		print("ln - <%s>" % ln)
+
+		#
+		# Skip any lines that don't fit this naming pattern.
+		#
+		match = re.search(fnpat, ln)
+		if(match == None):
+			continue
+
+		#
+		# Skip any indices whose names don't start with "tpot".
+		#
+		indfn = match.group(1)
+		if(indfn[0:4] != 'tpot'):
+			continue
+
+		debugloc = 82
+		#
+		# Skip any indices whose names don't start with one of
+		# the desired tpot names.
+		#
+		fnpat = r'^(tpot\w*)\-.*\-(\d{4}\.\d{2}\.\d{2})'
+		match = re.search(fnpat, indfn)
+		if(match == None):
+			print("\tno tpot match in <%s>" % indfn)
+			continue
+
+		#
+		# Skip this index if it isn't a tpot index.
+		#
+		tpfx  = match.group(1)
+		if(tpfx not in tpotlist):
+			continue
+#		print("ln - <%s>" % ln)
+
+		debugloc = 83
+		#
+		# Get the date from the index name.
+		#
+		tstmp = match.group(2)
+#		print("tpfx  - <%s>" % tpfx)
+#		print("tstmp - <%s>" % tstmp)
+#		print("index:  %-8s %s" % (tpfx, tstmp))
+
+		#
+		# Use the after-date from the config file, if there is one.
+		#
+		tpotafter = after
+		if(tpfx not in lastdates):
+			print("setting lastdates[%s] - <%s>" % (tpfx, after))
+			lastdates[tpfx] = after
+		else:
+
+			#
+			# Find the earliest of the tpot's last honeypot processing.
+			#
+			mintstmp = LAST
+			for hp in known_hpots:
+				tmptstmp = lastdates[tpfx][hp]
+
+				if(tmptstmp < mintstmp):
+					mintstmp = tmptstmp
+
+			#
+			# Use the earliest as the point we'll start looking for
+			# this tpot.
+			#
+			if(mintstmp > tpotafter):
+				tpotafter = mintstmp
+
+		#
+		# Skip this index if it's after the -before date.
+		#
+		if(tstmp >= before):
+			continue
+
+		#
+		# Skip this index if it's before the after date.
+		#
+		if(tstmp <= tpotafter):
+			continue
+
+		#
+		# Save the name of the tpot this is for.
+		# This is just an optimization so we don't have to dig
+		# out the tpot names later.
+		#
+		idx2tpot[indfn] = tpfx
+
+		#
+		# Add this index to our list of indices.
+		#
+		lines.append(indfn)
+
+	#
+	# Return the sorted converted output to our caller.
+	#
+	lines.sort()
+
+	return(lines)
+
+
+#------------------------------------------------------------------------
+# Routine:	psout()
+#
+# Purpose:	Runs a ps command with a given set of arguments.  The
+#		command is run in a subprocess The output the command
+#		writes to stdout is returned in a list.
+#
+def psout(cmdline):
+
+	cmdline.insert(0, '/bin/ps')
+
+	#
+	# Run the caller's command.
+	#
+	try:
+		bout = subprocess.check_output(cmdline)
+
+	#
+	# Handle OSErrors -- most likely an unrecognized command.
+	#
+	except OSError as exc:
+		print(exc.strerror)
+		exit(1);
+
+	#
+	# Handle CalledProcessErrors -- errors with the program we just ran.
+	#
+	except subprocess.CalledProcessError as exc:
+		retcode = exc.returncode;
+		print(exc.strerror)
+		exit(retcode);
+
+	#
+	# Convert the bytearray into a string, and then split the lines.
+	#
+	out = bout.decode("utf-8")
+	lines = out.splitlines()
+
+	#
+	# Return the converted output to our caller.
+	#
+	return(lines)
+
+
+#----------------------------------------------------------------------
+# Routine:	sectionizer()
+#
+# Purpose:	Print a header for a new section of statistics.
+#
+def sectionizer(str):
+	print("\n------------------------------------------------------------")
+	print(str)
+
+
+#----------------------------------------------------------------------
+# Routine:	usage()
+#
+# Purpose:	Do something with the usage message.
+#
+#		If the prtflag parameter is non-zero, we'll print and exit.
+#		If it is zero, we'll just return the string.
+#
+def usage(prtflag):
+
+	#
+	# Set up our usage string.
+	#
+	outstr = """usage:  tpoturls-to-kafka [options] <tpot-name>
+
+        where [options] are:
+
+                -all            	get command data from all defined tpots
+                -after yyyy.mm.dd	give entries after this date
+                -before yyyy.mm.dd	give ntries before this date
+                -config conffile	configuration file for posting dates
+                -tunnel			set up an SSH tunnel for comms
+
+                -verbose		give verbose output
+                -Version		give version and exit
+                -help			show usage message
+                -man			give man page and exit
+ """
+
+	#
+	# Just return the output if we aren't to print the usage string.
+	#
+	if(prtflag == 0):
+		return(outstr)
+
+	#
+	# Print the usage string and exit.
+	#
+	print(outstr.rstrip())
+	exit(0)
+
+
+#----------------------------------------------------------------------
+# Routine:      manpage()
+#
+# Purpose:	Print the manpage and exit.
+#
+def manpage():
+
+	global man
+
+	print(man)
+	sys.exit(0)
+
+
+###############################################################################
+
+#------------------------------------------------------------------------
+#
+# Do everything.
+#
+
+if __name__ == '__main__':
+
+	try:
+		sys.exit(main())
+
+	except Exception as exc:
+		print("\nexception of some sort\n")
+		print(exc)
+		print("")
+
+		print("debugloc - %d" % debugloc)
+		print("")
+
+		#
+		# Close the tpot tunnel we opened.
+		#
+		closetunnel()
+
+		exit(31)
+

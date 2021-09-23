@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+#
+# gawseed-wrapper	This script is a wrapper around Gawseed commands.
+#			It runs a user-specified command line a certain
+#			number of times.  If the command succeeds (exits
+#			with a zero return code), then this script stops.
+#			If it exits with a non-zero return code, this
+#			script waits a few seconds and then tries again.
+#
+#	usage:
+#		gawseed-wrapper [-... | -help | -Version] "<command line>"
+#
+# Revision History
+#	1.0	Initial revision.				210517
+#
+#	Written by Wayne Morrison, 210421.
+#
+
+import os
+import sys
+import time
+
+import argparse
+import subprocess
+
+
+#
+# Version information.
+#
+NAME = "gawseed-wrapper"
+VERS = NAME + " version: 1.0"
+
+#------------------------------------------------------------------------
+
+man = '''
+
+NAME
+
+gawseed-wrapper - wrapper for Gawseed commands run with cron
+
+SYNOPSIS
+
+  gawseed-wrapper [options] <command> <arguments>
+
+DESCRIPTION
+gawseed-wrapper	is a wrapper around Gawseed commands running as daily runs.
+It runs a user-specified command line a certain number of times.  If the 
+command succeeds (exits with a zero return code), then this script stops.
+If it exits with a non-zero return code, this script waits a few seconds
+and then tries again.
+
+This script was primarily intended for Gawseed scripts run as cron jobs,
+such as tpotcmds-to-kafka and tpotcmds-findurls.
+
+USAGE
+
+If options will be passed to the user's command, then some or all of the
+command line should be enclosed in quotes.  This is related to a problem
+with Python's argument-processing facility and how it recognizes options.
+
+Examples:
+
+	gawseed-wrapper tpotcmds-findurls tpot3
+
+	gawseed-wrapper -runs 50 -seconds 10 tpotcmds-findurls tpot3
+
+	gawseed-wrapper "tpotcmds-findurls -all"
+
+	gawseed-wrapper tpotcmds-findurls " -all"
+
+OPTIONS
+
+gawseed-wrapper takes the following options:
+
+	-runs runcount
+		Number of times to run the command
+		Default is 20 execution attempts.
+
+	-sleep seconds
+		Number of seconds to sleep between runs.
+		Default is 5 seconds.
+
+	-verbose
+		Display verbose information.
+
+	-Version
+		Display the version information for gawseed-wrapper.
+
+	-help
+		Display a help message.
+
+	-man
+		Display a manual page.
+
+SEE ALSO
+
+cron(8)
+
+AUTHOR
+
+Wayne Morrison, tewok@tislabs.com
+
+'''
+
+#------------------------------------------------------------------------
+# Option fields.
+#	options handled:
+#		-runs times		times to run the command
+#		-sleep seconds		sleep-time between runs
+#		-verbose		turn on verbose output
+#		-help			give usage message and exit
+#		-man			give manual page and exit
+#		-Version		give command version info and exit
+#
+
+MAXRUNS	= 20			# Default number of execution attempts.
+NAPTIME	= 5			# Default number of seconds between runs.
+
+naptime	= NAPTIME		# Time to sleep between executions.
+runs	= MAXRUNS		# Number of times to run the command.
+
+verbose = 0			# Verbose flag.
+
+debug = 0			# Internal debugging flag.
+
+#------------------------------------------------------------------------
+# Globbies.
+#
+
+cmdargs = []			# List of command and arguments.
+cmdline = ''			# Command line to run.
+
+#------------------------------------------------------------------------
+# Routine:	main()
+#
+# Purpose:	Do shtuff.
+#
+def main():
+	global runs			# Number of times to run the command.
+
+	#
+	# Parse our command line.
+	#
+	getopts()
+
+	#
+	# Run the user's command, and wait a bit between executions.
+	#
+	while(runs > 0):
+
+		runner()
+
+		#
+		# Another run bites the dust.
+		#
+		runs -= 1
+
+		#
+		# We're checking this here so the final failed execution
+		# doesn't have a pointless pause.
+		#
+		if(runs == 0): break
+
+		time.sleep(naptime)
+
+
+	print("\nfailed all attempts to run \"%s\"" % cmdline)
+
+	sys.exit(80)
+
+
+#------------------------------------------------------------------------
+# Routine:	getopts()
+#
+# Purpose:	Parse the command line for options.
+#
+def getopts():
+	global cmdargs			# List of command and arguments.
+	global cmdline			# Command line to run.
+	global naptime			# Time to sleep between executions.
+	global runs			# Number of times to run the command.
+	global verbose			# Verbose flag.
+
+	#
+	# Build our usage string.
+	#
+	usagestr = usage(0)
+
+	#
+	# Build the options parser.
+	#
+	ap = argparse.ArgumentParser(usage=usagestr, add_help=False)
+
+	#
+	# Add the recognized options.
+	#
+	ap.add_argument('-verbose', action='store_true')
+	ap.add_argument('-Version', action='version', version=VERS)
+	ap.add_argument('-help',    action='store_true')
+	ap.add_argument('-man',     action='store_true')
+
+	ap.add_argument('-runs')
+	ap.add_argument('-sleep')
+
+	ap.add_argument('cmdargs',  nargs='*')
+
+	#
+	# Now parse the options.
+	#
+	args = ap.parse_args()
+
+	#
+	# Check for some immediate options.
+	#
+	if(args.help):		usage(1)
+	if(args.man):		manpage()
+	if(args.verbose):	verbose	= 1
+
+	if(args.runs):		runs	= int(args.runs)
+	if(args.sleep):		naptime	= int(args.sleep)
+
+	#
+	# Get the user's command line and break it into pieces.
+	#
+	cmdline = ' '.join(args.cmdargs)
+	cmdargs = cmdline.split()
+
+	if(verbose):
+		print("command line:  %s" % cmdline)
+		print("maximum runs:  %d" % runs)
+		print("sleep-time:    %d" % naptime)
+		print("")
+
+
+#------------------------------------------------------------------------
+# Routine:	runner()
+#
+# Purpose:	Runs the user's command once.
+#		If the command exits with a zero return code, we'll exit here.
+#
+def runner():
+
+	if(verbose):
+		print("\n\nrunning \"%s\"\n" % cmdline)
+
+	#
+	# Run the caller's command.
+	#
+	try:
+
+		results = subprocess.run(cmdargs)
+
+		#
+		# If everything worked well, we'll exit here.
+		#
+		if(results.returncode == 0):
+			sys.exit(0)
+
+	#
+	# Handle OSErrors -- most likely an unrecognized command.
+	#
+	except OSError as exc:
+		print(exc.strerror)
+
+	#
+	# Handle CalledProcessErrors -- errors with the program we just ran.
+	#
+	except subprocess.CalledProcessError as exc:
+		print(exc.strerror)
+
+
+#----------------------------------------------------------------------
+# Routine:	usage()
+#
+# Purpose:	Do something with the usage message.
+#
+#		If the prtflag parameter is non-zero, we'll print and exit.
+#		If it is zero, we'll just return the string.
+#
+def usage(prtflag):
+
+	#
+	# Set up our usage string.
+	#
+	outstr = """usage:  gawseed-wrapper [options] <command> <arguments>
+
+        where [options] are:
+
+                -max runs        - times to run the command
+                -sleep seconds   - sleep time between runs
+
+                -verbose         - give verbose output
+                -Version         - show version and exit
+                -help            - show usage message
+                -man             - show manual page
+ """
+
+	#
+	# Just return the output if we aren't to print the usage string.
+	#
+	if(prtflag == 0):
+		return(outstr)
+
+	#
+	# Print the usage string and exit.
+	#
+	print(outstr.rstrip())
+	exit(0)
+
+
+#----------------------------------------------------------------------
+# Routine:	manpage()
+#
+# Purpose:	Print the manpage and exit.
+#
+def manpage():
+
+	global man
+
+	print(man)
+	exit(0)
+
+
+###############################################################################
+
+#------------------------------------------------------------------------
+#
+# Do everything.
+#
+
+if __name__ == '__main__':
+
+	try:
+		sys.exit(main())
+
+	except Exception as exc:
+		print(exc)
+		print("")
+
+		exit(31)
+
+#------------------------------------------------------------------------
+
